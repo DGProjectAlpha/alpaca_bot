@@ -286,6 +286,9 @@ def build_iron_condor(
         ),
     )
     setup.score = _score_setup(prob, setup.risk_reward_ratio, vix_bonus=(vix > 20))
+    # Iron condors are the bread and butter in high vol — give extra boost
+    if vix > 22:
+        setup.score += 0.10
     return setup
 
 
@@ -476,9 +479,10 @@ def build_momentum_trade(
         risk_budget=config.RISK_MOMENTUM,
         reason=f"{label} | ${strike:.0f} strike | {dte}DTE | Cost ~${est_cost:.0f}/contract",
     )
-    # Score: momentum gets a moderate score — not as reliable as premium selling
-    rsi_quality = 0.3 if 50 <= rsi <= 70 else 0.15
-    setup.score = 0.35 + rsi_quality + (0.1 if vix < 25 else 0)
+    # Score: momentum is speculative — penalize in high vol (should sell premium instead)
+    rsi_quality = 0.2 if 50 <= rsi <= 70 else 0.1
+    vol_penalty = -0.15 if vix > 20 else (-0.05 if vix > 15 else 0.1)
+    setup.score = 0.35 + rsi_quality + vol_penalty
     return setup
 
 
@@ -871,9 +875,18 @@ def select_strategy(
                 setups.append(es)
             break  # one per ticker
 
-    # Sort by score (best first) and return top 5
+    # Sort by score (best first), then diversify — max 2 of same strategy type
     setups.sort(key=lambda s: s.score, reverse=True)
-    return setups[:5]
+    diversified = []
+    strategy_counts = {}
+    for s in setups:
+        stype = s.strategy.value
+        if strategy_counts.get(stype, 0) < 2:
+            diversified.append(s)
+            strategy_counts[stype] = strategy_counts.get(stype, 0) + 1
+        if len(diversified) >= 5:
+            break
+    return diversified
 
 
 def _days_to_expiration(exp_date_str: str) -> int:
