@@ -301,6 +301,12 @@ def build_iron_condor(
         (0.3 if vix > 20 else 0.1)  # bonus for high vol environment
     )
 
+    # Minimum credit filter: need at least 20% of spread width as credit
+    # Otherwise risk/reward is unacceptable
+    min_credit = spread_width * 0.20 * 100  # 20% of wing width
+    if setup.max_profit < min_credit:
+        return None  # not enough premium to justify the risk
+
     return setup
 
 
@@ -463,8 +469,12 @@ def select_strategy(
     # ── High Volatility: Iron Condors are king ──
     if regime == MarketRegime.HIGH_VOL:
         # 0-3 DTE iron condors on SPY — use $5 wide wings for better premium
+        # Skip 0DTE after 11 AM ET — not enough theta left to sell
+        now_et = datetime.now()
         for exp in expirations:
             dte = _days_to_expiration(exp)
+            if dte == 0 and now_et.hour >= 11:
+                continue  # too late for 0DTE
             if 0 <= dte <= 3:
                 ic = build_iron_condor(
                     "SPY", spy_price, vix, dte, exp,

@@ -649,17 +649,19 @@ class AlpacaBotOptions:
                 )
                 if real_premium > 0:
                     setup.max_profit = real_premium * 100
-                    # Recalculate max_loss and risk/reward with real numbers
-                    # For spreads: max_loss = (spread_width * 100) - net_premium
+                    # Recalculate max_loss with real numbers
+                    # Iron condor: max loss = width of ONE side - total premium
+                    # (you can only lose on one side at a time)
                     if len(setup.legs) >= 4:  # iron condor
-                        sell_strikes = [l.strike for l in setup.legs if l.side == "sell"]
-                        buy_strikes = [l.strike for l in setup.legs if l.side == "buy"]
-                        if sell_strikes and buy_strikes:
-                            spread_width = max(abs(s - b) for s in sell_strikes for b in buy_strikes if abs(s - b) < 20)
-                            setup.max_loss = (spread_width * 100) - setup.max_profit
+                        # Match put side and call side separately
+                        put_legs = sorted([l for l in setup.legs if l.option_type == "put"], key=lambda l: l.strike)
+                        call_legs = sorted([l for l in setup.legs if l.option_type == "call"], key=lambda l: l.strike)
+                        put_width = abs(put_legs[-1].strike - put_legs[0].strike) if len(put_legs) == 2 else 5
+                        call_width = abs(call_legs[-1].strike - call_legs[0].strike) if len(call_legs) == 2 else 5
+                        spread_width = max(put_width, call_width)
+                        setup.max_loss = (spread_width * 100) - setup.max_profit
                     elif len(setup.legs) == 2:  # credit spread
-                        strikes = [l.strike for l in setup.legs]
-                        spread_width = abs(strikes[0] - strikes[1])
+                        spread_width = abs(setup.legs[0].strike - setup.legs[1].strike)
                         setup.max_loss = (spread_width * 100) - setup.max_profit
                     # Update risk/reward ratio with real values
                     setup.risk_reward_ratio = setup.max_profit / setup.max_loss if setup.max_loss > 0 else 0
