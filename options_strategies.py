@@ -416,7 +416,12 @@ def build_debit_spread(
     if direction == TrendDirection.NEUTRAL:
         return None
     if spread_width is None:
-        spread_width = config.CS_SPREAD_WIDTH  # reuse credit spread width setting
+        # Debit spreads work better wider — more room for the stock to move through
+        # $5 wide on SPY/QQQ, $2 on cheaper stocks
+        if price > 100:
+            spread_width = 5.0
+        else:
+            spread_width = 2.0
 
     inc = _strike_increment(price)
     move = _expected_move(price, vix, dte)
@@ -446,17 +451,23 @@ def build_debit_spread(
         ]
         label = f"Bear Put Spread on {underlying} | Bearish | {long_strike}/{short_strike}P"
 
-    # Estimate debit as ~60-70% of spread width (ITM component)
-    est_debit_pct = 0.65 if vix > 20 else 0.60
+    # Estimate debit: slightly ITM long + OTM short
+    # Wider spreads have lower debit as % (the short leg offsets more)
+    if spread_width >= 5:
+        est_debit_pct = 0.50 if vix > 20 else 0.55  # ~50-55% for $5 wide
+    else:
+        est_debit_pct = 0.60 if vix > 20 else 0.65  # ~60-65% for $2 wide
     est_debit = spread_width * est_debit_pct * 100  # cost per contract
     max_profit = (spread_width * 100) - est_debit
     max_loss = est_debit
 
-    # Small account guard
-    if max_loss > equity * 0.05:
+    # Small account guard — use same risk budget as credit spreads (5% = $100 on $2k)
+    # But for debit spreads, the max loss IS the debit paid — it's already defined risk
+    risk_budget = config.RISK_CREDIT_SPREAD
+    if max_loss > equity * risk_budget:
         return None
 
-    contracts = size_contracts(max_loss, equity, config.RISK_CREDIT_SPREAD)
+    contracts = size_contracts(max_loss, equity, risk_budget)
 
     # PoP for debit spreads: ~45-55% depending on how close to ATM
     prob = 0.50 if vix > 20 else 0.45
@@ -477,11 +488,19 @@ def build_debit_spread(
         risk_budget=config.RISK_CREDIT_SPREAD,
         reason=f"{label} | {dte}DTE | VIX={vix:.1f} | Debit ~${est_debit:.0f}",
     )
-    # Debit spreads score: moderate PoP, decent R:R, big trend bonus
-    setup.score = _score_setup(prob, rr, vix_bonus=(vix > 20), trend_bonus=True)
-    # Debit spreads LOVE high vol + trend — opposite of iron condors
-    if vix > 20 and direction != TrendDirection.NEUTRAL:
-        setup.score += 0.08
+    # Debit spreads have lower PoP (~50%) but higher R:R.
+    # Use a custom score that doesn't penalize sub-55% PoP like credit strategies.
+    # Instead, weight R:R and EV more heavily.
+    ev_per_dollar = prob * rr - (1 - prob) * 1.0
+    ev_score = max(ev_per_dollar, 0.0)
+    setup.score = (
+        prob * 0.35 +                              # PoP matters less for debit
+        min(rr, 2.0) / 2.0 * 0.30 +              # R:R matters MORE
+        min(ev_score, 0.5) * 0.20 +              # EV is key
+        0.10 +                                     # trend bonus (always on for debit)
+        (0.05 if vix > 20 else 0.0)              # high vol = bigger moves = good
+    )
+    setup.score = min(setup.score, 1.0)
     return setup
 
 
