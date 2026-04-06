@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+*.log
+briefings/
+reviews/
+approved_trades.json
