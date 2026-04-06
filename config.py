@@ -27,11 +27,18 @@ TELEGRAM_ALERTS_TOPIC_ID = int(_topic_id_raw) if _topic_id_raw else None
 DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 
 # ═══════════════════════════════════════════════════════════════
+# Account Size — $2,000 ($1,000 cash + $1,000 margin)
+# ═══════════════════════════════════════════════════════════════
+ACCOUNT_EQUITY = float(os.getenv("ACCOUNT_EQUITY", "2000"))
+CASH_PORTION = float(os.getenv("CASH_PORTION", "1000"))
+MARGIN_PORTION = float(os.getenv("MARGIN_PORTION", "1000"))
+
+# ═══════════════════════════════════════════════════════════════
 # Stock Trading (original bot)
 # ═══════════════════════════════════════════════════════════════
-MAX_CAPITAL = float(os.getenv("MAX_CAPITAL", "1000"))
-MAX_POSITION_PCT = 0.20
-MAX_POSITIONS = 5
+MAX_CAPITAL = float(os.getenv("MAX_CAPITAL", "2000"))
+MAX_POSITION_PCT = 0.15          # 15% max per position ($300)
+MAX_POSITIONS = 4                # max 4 simultaneous positions
 STOP_LOSS_PCT = 0.03
 TAKE_PROFIT_PCT = 0.06
 
@@ -54,10 +61,11 @@ MARKET_OPEN = "09:30"
 MARKET_CLOSE = "16:00"
 
 # ═══════════════════════════════════════════════════════════════
-# Options Trading — General
+# Options Trading — General ($2,000 account)
 # ═══════════════════════════════════════════════════════════════
-OPTIONS_MAX_CAPITAL = float(os.getenv("OPTIONS_MAX_CAPITAL", "1000"))
-OPTIONS_MAX_POSITIONS = int(os.getenv("OPTIONS_MAX_POSITIONS", "5"))
+OPTIONS_MAX_CAPITAL = float(os.getenv("OPTIONS_MAX_CAPITAL", "2000"))
+OPTIONS_MAX_POSITIONS = int(os.getenv("OPTIONS_MAX_POSITIONS", "3"))  # 3 max — don't overexpose a small account
+OPTIONS_MAX_DAILY_LOSS = float(os.getenv("OPTIONS_MAX_DAILY_LOSS", "200"))  # $200 daily loss circuit breaker (10%)
 
 # ═══════════════════════════════════════════════════════════════
 # Multi-Ticker Universe
@@ -65,14 +73,13 @@ OPTIONS_MAX_POSITIONS = int(os.getenv("OPTIONS_MAX_POSITIONS", "5"))
 ETF_UNIVERSE = ["SPY", "QQQ", "IWM", "DIA"]
 STOCK_UNIVERSE = ["TSLA", "NVDA", "AMD", "META", "AMZN", "AAPL", "GOOGL", "MSFT"]
 WHEEL_STOCKS = [
-    "SOFI",    # ~$10 — $1,000 collateral
-    "SNAP",    # ~$10 — $1,000 collateral
-    "F",       # ~$10 — $1,000 collateral
-    "NIO",     # ~$5  — $500 collateral
-    "HOOD",    # ~$20 — $2,000 collateral
-    "T",       # ~$20 — $2,000 collateral
-    "PLTR",    # ~$25 — $2,500 collateral
-    "RIVN",    # ~$12 — $1,200 collateral
+    # Only stocks where 1 CSP contract collateral fits in our budget
+    # With $2,000 account, max ~$500-800 collateral per wheel position
+    "NIO",     # ~$5  — $500 collateral ✅
+    "F",       # ~$10 — $1,000 collateral (tight but doable)
+    "SOFI",    # ~$10 — $1,000 collateral (tight but doable)
+    "SNAP",    # ~$10 — $1,000 collateral (tight but doable)
+    # Removed: HOOD ($2k), T ($2k), PLTR ($2.5k), RIVN ($1.2k) — too expensive
 ]
 
 # All tickers combined (for data fetching)
@@ -87,29 +94,30 @@ VIX_CHANGE_THRESHOLD = 1.0       # 1-point VIX change triggers full rescan
 
 # ═══════════════════════════════════════════════════════════════
 # Strategy Risk Limits (% of equity per trade)
+# Tighter limits for $2,000 account — survival > growth
 # ═══════════════════════════════════════════════════════════════
-RISK_IRON_CONDOR = 0.05          # 5%  — defined risk, high probability
-RISK_CREDIT_SPREAD = 0.05        # 5%  — defined risk, directional
-RISK_WHEEL_CSP = 0.10            # 10% — collateral-based (actual risk is lower)
-RISK_MOMENTUM = 0.02             # 2%  — speculative long options
-RISK_CALENDAR = 0.03             # 3%  — moderate risk spread
-RISK_BUTTERFLY = 0.01            # 1%  — cheap lottery tickets
-RISK_EARNINGS = 0.04             # 4%  — short premium around events
+RISK_IRON_CONDOR = 0.05          # 5% = $100 max loss per IC
+RISK_CREDIT_SPREAD = 0.05        # 5% = $100 max loss per spread
+RISK_WHEEL_CSP = 0.25            # 25% = $500 collateral (1 contract on ~$5 stock)
+RISK_MOMENTUM = 0.03             # 3% = $60 max per speculative play
+RISK_CALENDAR = 0.04             # 4% = $80 max per calendar
+RISK_BUTTERFLY = 0.02            # 2% = $40 per butterfly (cheap lottery)
+RISK_EARNINGS = 0.04             # 4% = $80 max per earnings play
 
 # ═══════════════════════════════════════════════════════════════
 # Strategy-Specific Defaults
 # ═══════════════════════════════════════════════════════════════
 
-# Iron Condors
-IC_SPREAD_WIDTH = 5.0            # $5 wide wings
+# Iron Condors — narrower wings for small account
+IC_SPREAD_WIDTH = 2.0            # $2 wide wings = $200 max loss per contract
 IC_TARGET_DTE_MIN = 0
 IC_TARGET_DTE_MAX = 7
 IC_PROFIT_TARGET = 0.50          # close at 50% of max profit
 IC_STOP_LOSS = 2.0               # close at 2x premium loss
 IC_MIN_VIX = 20.0                # only in elevated vol
 
-# Credit Spreads
-CS_SPREAD_WIDTH = 5.0
+# Credit Spreads — narrower for small account
+CS_SPREAD_WIDTH = 2.0            # $2 wide = $200 max loss per contract
 CS_TARGET_DTE_MIN = 5
 CS_TARGET_DTE_MAX = 21
 CS_PROFIT_TARGET = 0.50
@@ -138,8 +146,8 @@ CAL_FAR_DTE_MAX = 45
 CAL_PROFIT_TARGET = 0.50
 CAL_STOP_LOSS = 1.5
 
-# Butterfly Spreads
-BF_SPREAD_WIDTH = 5.0
+# Butterfly Spreads — narrower for small account
+BF_SPREAD_WIDTH = 2.0            # $2 wide = cheaper entry
 BF_TARGET_DTE_MIN = 7
 BF_TARGET_DTE_MAX = 21
 BF_PROFIT_TARGET = 1.0           # these are cheap — let winners run

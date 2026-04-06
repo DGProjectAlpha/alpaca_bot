@@ -1,13 +1,13 @@
 {
-  "timestamp": "2026-04-06T12:27:36.292139-04:00",
+  "timestamp": "2026-04-06T13:01:22.046791-04:00",
   "market": {
-    "spy_price": 657.765,
-    "vix": 23.5492,
+    "spy_price": 657.59,
+    "vix": 23.6698,
     "regime": "high_vol",
     "trend": "bullish",
-    "ema_20": 655.8169987406565,
-    "ema_50": 652.5965656067592,
-    "rsi": 60.47314916658193,
+    "ema_20": 655.8341415977993,
+    "ema_50": 652.6036244302886,
+    "rsi": 61.12162488097134,
     "trigger": "morning_briefing",
     "open_positions": 0,
     "tickers_analyzed": 20
@@ -17,14 +17,14 @@
       "strategy": "iron_condor",
       "underlying": "SPY",
       "contracts": 10,
-      "max_profit": 30.0,
-      "max_loss": 470.0,
+      "max_profit": 36.00000000000001,
+      "max_loss": 464.0,
       "probability_of_profit": 0.68,
-      "risk_reward_ratio": 0.06382978723404255,
+      "risk_reward_ratio": 0.07758620689655174,
       "risk_budget": 0.05,
       "target_dte": 1,
-      "score": 0.7005714285714285,
-      "reason": "Iron Condor on SPY | VIX=23.5 (elevated \u2014 sell premium) | Range: $645-$670 | 1DTE | Expected move: +/-$9.8",
+      "score": 0.5971428571428572,
+      "reason": "Iron Condor on SPY | VIX=23.7 (elevated \u2014 sell premium) | Range: $645-$670 | 1DTE | Expected move: +/-$9.8",
       "legs": [
         {
           "symbol": "SPY260407P00640000",
@@ -32,7 +32,7 @@
           "option_type": "put",
           "strike": 640.0,
           "expiration": "2026-04-07",
-          "premium": 0.275,
+          "premium": 0.255,
           "quantity": 1
         },
         {
@@ -41,7 +41,7 @@
           "option_type": "put",
           "strike": 645.0,
           "expiration": "2026-04-07",
-          "premium": 0.485,
+          "premium": 0.535,
           "quantity": 1
         },
         {
@@ -50,7 +50,7 @@
           "option_type": "call",
           "strike": 670.0,
           "expiration": "2026-04-07",
-          "premium": 0.14500000000000002,
+          "premium": 0.135,
           "quantity": 1
         },
         {
@@ -68,14 +68,14 @@
       "strategy": "iron_condor",
       "underlying": "SPY",
       "contracts": 11,
-      "max_profit": 48.0,
+      "max_profit": 47.999999999999986,
       "max_loss": 452.0,
       "probability_of_profit": 0.68,
-      "risk_reward_ratio": 0.10619469026548672,
+      "risk_reward_ratio": 0.1061946902654867,
       "risk_budget": 0.05,
       "target_dte": 2,
-      "score": 0.7005714285714285,
-      "reason": "Iron Condor on SPY | VIX=23.5 (elevated \u2014 sell premium) | Range: $640-$675 | 2DTE | Expected move: +/-$13.8",
+      "score": 0.5971428571428572,
+      "reason": "Iron Condor on SPY | VIX=23.7 (elevated \u2014 sell premium) | Range: $640-$675 | 2DTE | Expected move: +/-$13.9",
       "legs": [
         {
           "symbol": "SPY260408P00635000",
@@ -83,7 +83,7 @@
           "option_type": "put",
           "strike": 635.0,
           "expiration": "2026-04-08",
-          "premium": 0.535,
+          "premium": 0.595,
           "quantity": 1
         },
         {
@@ -92,7 +92,7 @@
           "option_type": "put",
           "strike": 640.0,
           "expiration": "2026-04-08",
-          "premium": 0.895,
+          "premium": 0.945,
           "quantity": 1
         },
         {
@@ -101,7 +101,7 @@
           "option_type": "call",
           "strike": 675.0,
           "expiration": "2026-04-08",
-          "premium": 0.175,
+          "premium": 0.165,
           "quantity": 1
         },
         {
@@ -110,40 +110,40 @@
           "option_type": "call",
           "strike": 680.0,
           "expiration": "2026-04-08",
-          "premium": 0.055,
+          "premium": 0.035,
           "quantity": 1
         }
       ]
     },
     {
       "strategy": "calendar_spread",
-      "underlying": "DIA",
+      "underlying": "MSFT",
       "contracts": 3,
-      "max_profit": 1398.21,
-      "max_loss": 336.0000000000001,
+      "max_profit": 1116.5100000000007,
+      "max_loss": 961.4999999999999,
       "probability_of_profit": 0.55,
-      "risk_reward_ratio": 4.161339285714284,
+      "risk_reward_ratio": 1.1612168486739478,
       "risk_budget": 0.03,
-      "target_dte": 11,
-      "score": 0.52,
-      "reason": "Calendar Spread on DIA | $465 strike | Sell 11DTE / Buy 25DTE | Theta decay play \u2014 near expires first",
+      "target_dte": 7,
+      "score": 0.5312500000000001,
+      "reason": "Calendar Spread on MSFT | $370 strike | Sell 7DTE / Buy 25DTE | Theta decay play \u2014 near expires first",
       "legs": [
         {
-          "symbol": "DIA260417C00465000",
+          "symbol": "MSFT260413C00370000",
           "side": "sell",
           "option_type": "call",
-          "strike": 465.0,
-          "expiration": "2026-04-17",
-          "premium": 7.529999999999999,
+          "strike": 370.0,
+          "expiration": "2026-04-13",
+          "premium": 6.550000000000001,
           "quantity": 1
         },
         {
-          "symbol": "DIA260501C00465000",
+          "symbol": "MSFT260501C00370000",
           "side": "buy",
           "option_type": "call",
-          "strike": 465.0,
+          "strike": 370.0,
           "expiration": "2026-05-01",
-          "premium": 10.89,
+          "premium": 16.165,
           "quantity": 1
         }
       ]

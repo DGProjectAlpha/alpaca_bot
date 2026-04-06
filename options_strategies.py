@@ -199,12 +199,17 @@ def _strike_increment(price: float) -> float:
 # ═══════════════════════════════════════════════════════════════
 
 def size_contracts(max_loss_per_contract: float, equity: float, risk_pct: float) -> int:
-    """Determine how many contracts to trade given risk budget."""
+    """
+    Determine how many contracts to trade given risk budget.
+    For small accounts ($2k), this will almost always be 1 contract.
+    That's fine — survival matters more than size.
+    """
     if max_loss_per_contract <= 0 or equity <= 0:
         return 1
     max_risk_dollars = equity * risk_pct
     contracts = int(max_risk_dollars / max_loss_per_contract)
-    return max(1, contracts)
+    # Hard cap: never more than 3 contracts on a $2k account
+    return max(1, min(contracts, 3))
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -263,6 +268,10 @@ def build_iron_condor(
         return None  # not enough credit
 
     contracts = size_contracts(max_loss, equity, config.RISK_IRON_CONDOR)
+
+    # Small account guard: if max loss per contract > 10% of equity, skip
+    if max_loss > equity * 0.10:
+        return None
     prob = 0.68 if vix > 20 else 0.60
 
     setup = OptionsTradeSetup(
@@ -354,6 +363,11 @@ def build_credit_spread(
     est_prem_pct = 0.30 if vix > 18 else 0.20
     est_premium = spread_width * est_prem_pct * 100
     max_loss = (spread_width * 100) - est_premium
+
+    # Small account guard
+    if max_loss > equity * 0.10:
+        return None
+
     contracts = size_contracts(max_loss, equity, config.RISK_CREDIT_SPREAD)
     prob = 0.65 if vix > 18 else 0.55
 
@@ -393,9 +407,12 @@ def build_wheel_csp(
     strike = round_to_strike(price - (move * 0.5), inc)
 
     collateral = strike * 100
-    if collateral > equity * config.RISK_WHEEL_CSP * 10:
-        # Can't afford even 1 contract within risk budget
+    # For a $2k account, collateral must fit within cash portion
+    # Max 50% of total equity in any single wheel position
+    if collateral > equity * 0.50:
         return None
+    if collateral > config.CASH_PORTION:
+        return None  # wheel CSPs use cash, not margin
 
     premium_pct = 0.03 if vix > 15 else 0.02
     est_premium = strike * premium_pct * 100
@@ -466,6 +483,11 @@ def build_momentum_trade(
 
     # Estimate option price ~5-8% of underlying for slightly OTM
     est_cost = price * 0.06 * 100  # per contract
+
+    # Small account: skip if a single contract costs more than 5% of equity
+    if est_cost > equity * 0.05:
+        return None
+
     max_risk = equity * config.RISK_MOMENTUM
     contracts = max(1, int(max_risk / est_cost)) if est_cost > 0 else 1
 

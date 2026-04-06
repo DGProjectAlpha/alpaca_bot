@@ -447,6 +447,23 @@ class AlpacaBotOptions:
         """
         Execute an options trade setup. Places orders for each leg.
         """
+        # Daily loss circuit breaker — stop trading if we've lost too much today
+        daily_pnl = get_today_pnl()
+        max_daily_loss = getattr(config, 'OPTIONS_MAX_DAILY_LOSS', 200)
+        if daily_pnl <= -max_daily_loss:
+            msg = (f"🛑 CIRCUIT BREAKER — Daily loss ${abs(daily_pnl):.0f} "
+                   f"exceeds ${max_daily_loss:.0f} limit. No more trades today.")
+            log.warning(msg)
+            self.telegram.send_trade_alert(msg)
+            log_activity("circuit_breaker", {"daily_pnl": daily_pnl, "limit": max_daily_loss})
+            return False
+
+        # Max positions check
+        open_count = sum(1 for p in self.active_positions if p.get("status") == "open")
+        if open_count >= config.OPTIONS_MAX_POSITIONS:
+            log.warning(f"⚠️ Max positions ({config.OPTIONS_MAX_POSITIONS}) reached. Skipping.")
+            return False
+
         if self.dry_run:
             log.info(f"🏜️ DRY RUN — would execute:")
             log.info(format_setup_summary(setup))
