@@ -1,12 +1,17 @@
 """
-Options Strategy Engine — Iron Condors, Credit Spreads, and The Wheel
-Designed for defined-risk options trading on Alpaca.
+Options Strategy Engine — Multi-Ticker, Multi-Strategy
 
-Strategy Selection Logic:
-  - High VIX (>20): Iron Condors (sell premium in both directions)
-  - Medium VIX (15-20) + Trend: Credit Spreads (directional)
-  - Low VIX (<15): Wheel Strategy on cheap equities (sell CSPs)
-  - Always defined risk. Always know max loss before entry.
+Seven strategies scored and ranked across a diverse ticker universe:
+  1. Iron Condors       — VIX >20, range-bound, ETFs only, 0-7 DTE
+  2. Credit Spreads     — trend detected, ETFs + stocks, 5-21 DTE
+  3. Wheel (CSP)        — low VIX (<15), cheap stocks, 14-45 DTE
+  4. Momentum Calls/Puts— breakout/breakdown via EMA + RSI, 7-30 DTE
+  5. Calendar Spreads   — steep IV term structure, any ticker
+  6. Butterfly Spreads  — low-vol pinning bets, ETFs + stocks near round numbers
+  7. Earnings Strangles — sell high IV rank (>70%) before announcements
+
+The select_strategy() function scans ALL tickers, checks which strategies
+apply to each, scores every viable setup, and returns the top 5 for review.
 """
 import math
 from datetime import datetime, timedelta
@@ -14,6 +19,12 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+import config
+
+
+# ═══════════════════════════════════════════════════════════════
+# Enums and Data Classes
+# ═══════════════════════════════════════════════════════════════
 
 class StrategyType(Enum):
     IRON_CONDOR = "iron_condor"
@@ -21,6 +32,11 @@ class StrategyType(Enum):
     BEAR_CALL_SPREAD = "bear_call_spread"
     CASH_SECURED_PUT = "cash_secured_put"
     COVERED_CALL = "covered_call"
+    LONG_CALL = "long_call"
+    LONG_PUT = "long_put"
+    CALENDAR_SPREAD = "calendar_spread"
+    BUTTERFLY = "butterfly"
+    EARNINGS_STRANGLE = "earnings_strangle"
 
 
 class MarketRegime(Enum):
@@ -53,16 +69,31 @@ class OptionsTradeSetup:
     strategy: StrategyType
     underlying: str           # e.g., "SPY"
     legs: list                # List of OptionLeg
-    max_profit: float = 0.0   # per-contract
+    max_profit: float = 0.0   # per-contract (dollars)
     max_loss: float = 0.0     # per-contract (always positive number)
     breakeven_low: float = 0.0
     breakeven_high: float = 0.0
     probability_of_profit: float = 0.0  # estimated
     risk_reward_ratio: float = 0.0
     target_dte: int = 0       # days to expiration
-    reason: str = ""
-    score: float = 0.0        # 0-1, how good this setup is
+    reason: str = ""          # why this ticker, this strategy, why now
+    score: float = 0.0        # 0-1, higher = better setup
     contracts: int = 1        # how many contracts to trade
+    risk_budget: float = 0.0  # max equity % allocated to this trade
+
+
+@dataclass
+class TickerAnalysis:
+    """Per-ticker technical analysis used for strategy selection."""
+    symbol: str
+    price: float
+    ema_20: float = 0.0
+    ema_50: float = 0.0
+    rsi: float = 50.0
+    recent_prices: list = field(default_factory=list)
+    trend: TrendDirection = TrendDirection.NEUTRAL
+    near_round_number: bool = False
+    iv_rank: float = 0.0       # 0-1, estimated from VIX proxy
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -84,7 +115,7 @@ def detect_trend(prices: list, ema_short: float, ema_long: float) -> TrendDirect
     Detect market trend from price data and EMAs.
     prices: list of recent close prices (newest last)
     """
-    if len(prices) < 5:
+    if len(prices) < 5 or ema_short == 0 or ema_long == 0:
         return TrendDirection.NEUTRAL
 
     current = prices[-1]
@@ -105,8 +136,38 @@ def detect_trend(prices: list, ema_short: float, ema_long: float) -> TrendDirect
     return TrendDirection.NEUTRAL
 
 
+def compute_rsi(prices: list, period: int = 14) -> float:
+    """Compute RSI from a list of close prices."""
+    if len(prices) < period + 1:
+        return 50.0
+    deltas = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
+    gains = [d if d > 0 else 0 for d in deltas]
+    losses = [-d if d < 0 else 0 for d in deltas]
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def is_near_round_number(price: float, tolerance_pct: float = 0.01) -> bool:
+    """Check if price is near a round number (multiples of 5 for stocks, 10 for ETFs)."""
+    for increment in [5, 10, 25, 50, 100]:
+        nearest = round(price / increment) * increment
+        if abs(price - nearest) / price <= tolerance_pct:
+            return True
+    return False
+
+
 # ═══════════════════════════════════════════════════════════════
-# Strike Selection
+# Strike Selection Helpers
 # ═══════════════════════════════════════════════════════════════
 
 def round_to_strike(price: float, increment: float = 1.0) -> float:
@@ -114,123 +175,36 @@ def round_to_strike(price: float, increment: float = 1.0) -> float:
     return round(price / increment) * increment
 
 
-def select_iron_condor_strikes(
-    current_price: float,
-    vix: float,
-    dte: int,
-    spread_width: float = 2.0,
-    strike_increment: float = 1.0,
-) -> dict:
-    """
-    Select iron condor strikes based on current price and volatility.
-
-    Places short strikes at ~1 standard deviation away (delta ~0.16).
-    The higher the VIX, the wider the wings — more premium, more room.
-
-    Returns dict with put_buy, put_sell, call_sell, call_buy strikes.
-    """
-    # Annualized vol → daily vol → move over DTE period
-    # For 0DTE, use 0.5 days (half a trading day remaining on average)
-    daily_vol = (vix / 100) / math.sqrt(252)
-    time_factor = max(dte, 0.5)  # never zero — 0DTE still has intraday move
-    expected_move = current_price * daily_vol * math.sqrt(time_factor)
-
-    # Short strikes at ~1 standard deviation (adjustable)
-    # Higher VIX = we can go wider and still collect decent premium
-    if vix > 25:
-        sd_multiplier = 1.2  # wider in high vol
-    elif vix > 20:
-        sd_multiplier = 1.0  # standard
-    else:
-        sd_multiplier = 0.8  # tighter in low vol (but we shouldn't be doing IC in low vol)
-
-    offset = expected_move * sd_multiplier
-
-    put_sell = round_to_strike(current_price - offset, strike_increment)
-    put_buy = round_to_strike(put_sell - spread_width, strike_increment)
-    call_sell = round_to_strike(current_price + offset, strike_increment)
-    call_buy = round_to_strike(call_sell + spread_width, strike_increment)
-
-    # Sanity: short strikes must be OTM
-    if put_sell >= current_price:
-        put_sell = round_to_strike(current_price - strike_increment, strike_increment)
-        put_buy = put_sell - spread_width
-    if call_sell <= current_price:
-        call_sell = round_to_strike(current_price + strike_increment, strike_increment)
-        call_buy = call_sell + spread_width
-
-    return {
-        "put_buy": put_buy,
-        "put_sell": put_sell,
-        "call_sell": call_sell,
-        "call_buy": call_buy,
-    }
-
-
-def select_credit_spread_strikes(
-    current_price: float,
-    vix: float,
-    dte: int,
-    direction: TrendDirection,
-    spread_width: float = 2.0,
-    strike_increment: float = 1.0,
-) -> dict:
-    """
-    Select credit spread strikes.
-
-    Bullish → Bull Put Spread (sell put, buy lower put)
-    Bearish → Bear Call Spread (sell call, buy higher call)
-    """
+def _expected_move(price: float, vix: float, dte: int) -> float:
+    """Calculate expected move based on implied vol and time."""
     daily_vol = (vix / 100) / math.sqrt(252)
     time_factor = max(dte, 0.5)
-    expected_move = current_price * daily_vol * math.sqrt(time_factor)
+    return price * daily_vol * math.sqrt(time_factor)
 
-    # Place short strike at ~0.7-1.0 SD away from current price
-    offset = expected_move * 0.85
 
-    if direction == TrendDirection.BULLISH:
-        # Bull put spread — short put below market
-        short_strike = round_to_strike(current_price - offset, strike_increment)
-        long_strike = round_to_strike(short_strike - spread_width, strike_increment)
-        if short_strike >= current_price:
-            short_strike = round_to_strike(current_price - spread_width, strike_increment)
-            long_strike = short_strike - spread_width
-        return {
-            "type": "bull_put_spread",
-            "short_put": short_strike,
-            "long_put": long_strike,
-        }
+def _strike_increment(price: float) -> float:
+    """Pick appropriate strike increment based on price level."""
+    if price > 200:
+        return 5.0
+    elif price > 50:
+        return 1.0
+    elif price > 20:
+        return 0.5
     else:
-        # Bear call spread — short call above market
-        short_strike = round_to_strike(current_price + offset, strike_increment)
-        long_strike = round_to_strike(short_strike + spread_width, strike_increment)
-        if short_strike <= current_price:
-            short_strike = round_to_strike(current_price + spread_width, strike_increment)
-            long_strike = short_strike + spread_width
-        return {
-            "type": "bear_call_spread",
-            "short_call": short_strike,
-            "long_call": long_strike,
-        }
+        return 0.5
 
 
-def select_wheel_strike(
-    current_price: float,
-    vix: float,
-    dte: int,
-    strike_increment: float = 0.5,
-) -> float:
-    """
-    Select strike for cash-secured put (Wheel strategy).
-    Sell put slightly OTM — want to get assigned at a discount.
-    """
-    daily_vol = (vix / 100) / math.sqrt(252)
-    time_factor = max(dte, 0.5)
-    expected_move = current_price * daily_vol * math.sqrt(time_factor)
+# ═══════════════════════════════════════════════════════════════
+# Position Sizing
+# ═══════════════════════════════════════════════════════════════
 
-    # Put strike ~0.5 SD below current price (higher probability of profit)
-    target = current_price - (expected_move * 0.5)
-    return round_to_strike(target, strike_increment)
+def size_contracts(max_loss_per_contract: float, equity: float, risk_pct: float) -> int:
+    """Determine how many contracts to trade given risk budget."""
+    if max_loss_per_contract <= 0 or equity <= 0:
+        return 1
+    max_risk_dollars = equity * risk_pct
+    contracts = int(max_risk_dollars / max_loss_per_contract)
+    return max(1, contracts)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -239,194 +213,484 @@ def select_wheel_strike(
 
 def build_iron_condor(
     underlying: str,
-    current_price: float,
+    price: float,
     vix: float,
     dte: int,
     expiration: str,
-    max_capital: float,
-    spread_width: float = 2.0,
-    strike_increment: float = 1.0,
+    equity: float,
+    spread_width: float = None,
 ) -> Optional[OptionsTradeSetup]:
     """
-    Build a complete iron condor trade setup.
-
-    Returns None if the setup doesn't meet minimum criteria.
+    Iron Condor: sell OTM put spread + OTM call spread.
+    Only when VIX >20 and market is range-bound.
     """
-    strikes = select_iron_condor_strikes(
-        current_price, vix, dte, spread_width, strike_increment
-    )
+    if spread_width is None:
+        spread_width = config.IC_SPREAD_WIDTH
+    inc = _strike_increment(price)
+    move = _expected_move(price, vix, dte)
 
-    # Max loss per contract = spread_width - net premium (estimated)
-    # We estimate premium as ~30-40% of spread width in high vol
-    est_premium_pct = 0.35 if vix > 20 else 0.25
-    est_net_premium = spread_width * est_premium_pct * 100  # in dollars
-    max_loss_per_contract = (spread_width * 100) - est_net_premium
+    # Short strikes at ~1 SD, wider in higher vol
+    sd_mult = 1.2 if vix > 25 else 1.0
+    offset = move * sd_mult
 
-    # How many contracts can we afford?
-    contracts = max(1, int(max_capital * 0.25 / max_loss_per_contract))  # risk 25% max
+    put_sell = round_to_strike(price - offset, inc)
+    put_buy = round_to_strike(put_sell - spread_width, inc)
+    call_sell = round_to_strike(price + offset, inc)
+    call_buy = round_to_strike(call_sell + spread_width, inc)
 
-    # Probability estimate (rough — based on strikes being ~1 SD away)
-    prob_profit = 0.68 if vix > 20 else 0.60  # ~1 SD = 68% for IC
+    # Sanity: short strikes must be OTM
+    if put_sell >= price:
+        put_sell = round_to_strike(price - inc, inc)
+        put_buy = put_sell - spread_width
+    if call_sell <= price:
+        call_sell = round_to_strike(price + inc, inc)
+        call_buy = call_sell + spread_width
+
+    # Estimate premium as ~30-40% of spread width in high vol
+    est_prem_pct = 0.35 if vix > 25 else 0.30
+    est_premium = spread_width * est_prem_pct * 100
+    max_loss = (spread_width * 100) - est_premium
+
+    if est_premium < spread_width * 0.20 * 100:
+        return None  # not enough credit
+
+    contracts = size_contracts(max_loss, equity, config.RISK_IRON_CONDOR)
+    prob = 0.68 if vix > 20 else 0.60
 
     setup = OptionsTradeSetup(
         strategy=StrategyType.IRON_CONDOR,
         underlying=underlying,
         legs=[
             OptionLeg(symbol="", side="buy", option_type="put",
-                     strike=strikes["put_buy"], expiration=expiration),
+                      strike=put_buy, expiration=expiration),
             OptionLeg(symbol="", side="sell", option_type="put",
-                     strike=strikes["put_sell"], expiration=expiration),
+                      strike=put_sell, expiration=expiration),
             OptionLeg(symbol="", side="sell", option_type="call",
-                     strike=strikes["call_sell"], expiration=expiration),
+                      strike=call_sell, expiration=expiration),
             OptionLeg(symbol="", side="buy", option_type="call",
-                     strike=strikes["call_buy"], expiration=expiration),
+                      strike=call_buy, expiration=expiration),
         ],
-        max_profit=est_net_premium,
-        max_loss=max_loss_per_contract,
-        breakeven_low=strikes["put_sell"] - (est_net_premium / 100),
-        breakeven_high=strikes["call_sell"] + (est_net_premium / 100),
-        probability_of_profit=prob_profit,
-        risk_reward_ratio=est_net_premium / max_loss_per_contract if max_loss_per_contract > 0 else 0,
+        max_profit=est_premium,
+        max_loss=max_loss,
+        breakeven_low=put_sell - (est_premium / 100),
+        breakeven_high=call_sell + (est_premium / 100),
+        probability_of_profit=prob,
+        risk_reward_ratio=est_premium / max_loss if max_loss > 0 else 0,
         target_dte=dte,
         contracts=contracts,
-        reason=f"Iron Condor on {underlying} | VIX={vix:.1f} | "
-               f"Range: ${strikes['put_sell']:.0f}-${strikes['call_sell']:.0f} | "
-               f"{dte}DTE",
+        risk_budget=config.RISK_IRON_CONDOR,
+        reason=(
+            f"Iron Condor on {underlying} | VIX={vix:.1f} (elevated — sell premium) | "
+            f"Range: ${put_sell:.0f}-${call_sell:.0f} | {dte}DTE | "
+            f"Expected move: +/-${move:.1f}"
+        ),
     )
-
-    # Score: higher is better (good premium, high probability, decent R:R)
-    setup.score = (
-        prob_profit * 0.4 +
-        min(setup.risk_reward_ratio, 1.0) * 0.3 +
-        (0.3 if vix > 20 else 0.1)  # bonus for high vol environment
-    )
-
-    # Minimum credit filter: need at least 20% of spread width as credit
-    # Otherwise risk/reward is unacceptable
-    min_credit = spread_width * 0.20 * 100  # 20% of wing width
-    if setup.max_profit < min_credit:
-        return None  # not enough premium to justify the risk
-
+    setup.score = _score_setup(prob, setup.risk_reward_ratio, vix_bonus=(vix > 20))
     return setup
 
 
 def build_credit_spread(
     underlying: str,
-    current_price: float,
+    price: float,
     vix: float,
     dte: int,
     expiration: str,
     direction: TrendDirection,
-    max_capital: float,
-    spread_width: float = 2.0,
-    strike_increment: float = 1.0,
+    equity: float,
+    spread_width: float = None,
 ) -> Optional[OptionsTradeSetup]:
-    """Build a credit spread (bull put or bear call)."""
-    strikes = select_credit_spread_strikes(
-        current_price, vix, dte, direction, spread_width, strike_increment
-    )
+    """
+    Credit Spread: bull put or bear call, depending on trend.
+    Used when a clear directional bias exists.
+    """
+    if direction == TrendDirection.NEUTRAL:
+        return None
+    if spread_width is None:
+        spread_width = config.CS_SPREAD_WIDTH
+    inc = _strike_increment(price)
+    move = _expected_move(price, vix, dte)
+    offset = move * 0.85
 
-    est_premium_pct = 0.30 if vix > 18 else 0.20
-    est_net_premium = spread_width * est_premium_pct * 100
-    max_loss_per_contract = (spread_width * 100) - est_net_premium
-
-    contracts = max(1, int(max_capital * 0.30 / max_loss_per_contract))
-
-    if strikes["type"] == "bull_put_spread":
+    if direction == TrendDirection.BULLISH:
+        short_strike = round_to_strike(price - offset, inc)
+        long_strike = round_to_strike(short_strike - spread_width, inc)
+        if short_strike >= price:
+            short_strike = round_to_strike(price - spread_width, inc)
+            long_strike = short_strike - spread_width
         strategy = StrategyType.BULL_PUT_SPREAD
-        short_strike = strikes["short_put"]
-        long_strike = strikes["long_put"]
         legs = [
             OptionLeg(symbol="", side="sell", option_type="put",
-                     strike=short_strike, expiration=expiration),
+                      strike=short_strike, expiration=expiration),
             OptionLeg(symbol="", side="buy", option_type="put",
-                     strike=long_strike, expiration=expiration),
+                      strike=long_strike, expiration=expiration),
         ]
-        breakeven = short_strike - (est_net_premium / 100)
-        reason = f"Bull Put Spread on {underlying} | Bullish bias | {short_strike}/{long_strike}P | {dte}DTE"
+        label = f"Bull Put Spread on {underlying} | Bullish trend | {short_strike}/{long_strike}P"
     else:
+        short_strike = round_to_strike(price + offset, inc)
+        long_strike = round_to_strike(short_strike + spread_width, inc)
+        if short_strike <= price:
+            short_strike = round_to_strike(price + spread_width, inc)
+            long_strike = short_strike + spread_width
         strategy = StrategyType.BEAR_CALL_SPREAD
-        short_strike = strikes["short_call"]
-        long_strike = strikes["long_call"]
         legs = [
             OptionLeg(symbol="", side="sell", option_type="call",
-                     strike=short_strike, expiration=expiration),
+                      strike=short_strike, expiration=expiration),
             OptionLeg(symbol="", side="buy", option_type="call",
-                     strike=long_strike, expiration=expiration),
+                      strike=long_strike, expiration=expiration),
         ]
-        breakeven = short_strike + (est_net_premium / 100)
-        reason = f"Bear Call Spread on {underlying} | Bearish bias | {short_strike}/{long_strike}C | {dte}DTE"
+        label = f"Bear Call Spread on {underlying} | Bearish trend | {short_strike}/{long_strike}C"
 
-    prob_profit = 0.65 if vix > 18 else 0.55
+    est_prem_pct = 0.30 if vix > 18 else 0.20
+    est_premium = spread_width * est_prem_pct * 100
+    max_loss = (spread_width * 100) - est_premium
+    contracts = size_contracts(max_loss, equity, config.RISK_CREDIT_SPREAD)
+    prob = 0.65 if vix > 18 else 0.55
 
     setup = OptionsTradeSetup(
         strategy=strategy,
         underlying=underlying,
         legs=legs,
-        max_profit=est_net_premium,
-        max_loss=max_loss_per_contract,
-        breakeven_low=breakeven if strategy == StrategyType.BULL_PUT_SPREAD else 0,
-        breakeven_high=breakeven if strategy == StrategyType.BEAR_CALL_SPREAD else 0,
-        probability_of_profit=prob_profit,
-        risk_reward_ratio=est_net_premium / max_loss_per_contract if max_loss_per_contract > 0 else 0,
+        max_profit=est_premium,
+        max_loss=max_loss,
+        breakeven_low=short_strike - (est_premium / 100) if strategy == StrategyType.BULL_PUT_SPREAD else 0,
+        breakeven_high=short_strike + (est_premium / 100) if strategy == StrategyType.BEAR_CALL_SPREAD else 0,
+        probability_of_profit=prob,
+        risk_reward_ratio=est_premium / max_loss if max_loss > 0 else 0,
         target_dte=dte,
         contracts=contracts,
-        reason=reason,
+        risk_budget=config.RISK_CREDIT_SPREAD,
+        reason=f"{label} | {dte}DTE | VIX={vix:.1f}",
     )
-
-    setup.score = (
-        prob_profit * 0.35 +
-        min(setup.risk_reward_ratio, 1.0) * 0.35 +
-        (0.3 if direction != TrendDirection.NEUTRAL else 0.1)
-    )
-
+    setup.score = _score_setup(prob, setup.risk_reward_ratio, trend_bonus=True)
     return setup
 
 
 def build_wheel_csp(
     underlying: str,
-    current_price: float,
+    price: float,
     vix: float,
     dte: int,
     expiration: str,
-    max_capital: float,
-    strike_increment: float = 0.5,
+    equity: float,
 ) -> Optional[OptionsTradeSetup]:
-    """Build a cash-secured put for the Wheel strategy."""
-    strike = select_wheel_strike(current_price, vix, dte, strike_increment)
+    """
+    Cash-Secured Put for the Wheel strategy.
+    Low VIX, cheap stocks you'd be happy to own at a discount.
+    """
+    inc = _strike_increment(price)
+    move = _expected_move(price, vix, dte)
+    strike = round_to_strike(price - (move * 0.5), inc)
 
-    # Need enough cash to cover assignment
-    collateral = strike * 100  # 100 shares per contract
-    if collateral > max_capital:
-        return None  # can't afford it
+    collateral = strike * 100
+    if collateral > equity * config.RISK_WHEEL_CSP * 10:
+        # Can't afford even 1 contract within risk budget
+        return None
 
-    # Estimate premium (~2-4% of strike in normal vol)
     premium_pct = 0.03 if vix > 15 else 0.02
     est_premium = strike * premium_pct * 100
-
-    contracts = 1  # Wheel is typically 1 contract at a time for small accounts
+    contracts = 1  # wheel is typically 1 contract for small accounts
 
     setup = OptionsTradeSetup(
         strategy=StrategyType.CASH_SECURED_PUT,
         underlying=underlying,
         legs=[
             OptionLeg(symbol="", side="sell", option_type="put",
-                     strike=strike, expiration=expiration),
+                      strike=strike, expiration=expiration),
         ],
         max_profit=est_premium,
-        max_loss=collateral - est_premium,  # assigned at strike minus premium
+        max_loss=collateral - est_premium,
         breakeven_low=strike - (est_premium / 100),
-        probability_of_profit=0.70,  # typically high for slightly OTM puts
+        probability_of_profit=0.70,
         risk_reward_ratio=est_premium / (collateral - est_premium) if collateral > est_premium else 0,
         target_dte=dte,
         contracts=contracts,
-        reason=f"Wheel CSP on {underlying} | Strike ${strike:.2f} | "
-               f"Collateral ${collateral:.0f} | {dte}DTE",
+        risk_budget=config.RISK_WHEEL_CSP,
+        reason=(
+            f"Wheel CSP on {underlying} | VIX={vix:.1f} (low — wheel territory) | "
+            f"Strike ${strike:.2f} | Collateral ${collateral:.0f} | "
+            f"{dte}DTE | Would own at ${strike:.2f} if assigned"
+        ),
     )
-
-    setup.score = 0.5  # Wheel is always moderate — safe but slow
-
+    setup.score = 0.50  # wheel is steady but slow
     return setup
+
+
+def build_momentum_trade(
+    underlying: str,
+    price: float,
+    vix: float,
+    dte: int,
+    expiration: str,
+    direction: TrendDirection,
+    rsi: float,
+    equity: float,
+) -> Optional[OptionsTradeSetup]:
+    """
+    Momentum long call or long put.
+    Buy calls on strong breakouts (RSI rising, EMA cross up).
+    Buy puts on breakdowns (RSI falling, EMA cross down).
+    Max 2% of equity — these are speculative.
+    """
+    if direction == TrendDirection.NEUTRAL:
+        return None
+
+    inc = _strike_increment(price)
+    move = _expected_move(price, vix, dte)
+
+    if direction == TrendDirection.BULLISH:
+        if rsi < 40 or rsi > 80:
+            return None  # want RSI in 50-75 range for momentum (not exhausted)
+        # Buy slightly OTM call
+        strike = round_to_strike(price + (move * 0.3), inc)
+        strategy = StrategyType.LONG_CALL
+        option_type = "call"
+        label = f"Momentum CALL on {underlying} | Bullish breakout | RSI={rsi:.0f}"
+    else:
+        if rsi > 60 or rsi < 20:
+            return None
+        strike = round_to_strike(price - (move * 0.3), inc)
+        strategy = StrategyType.LONG_PUT
+        option_type = "put"
+        label = f"Momentum PUT on {underlying} | Bearish breakdown | RSI={rsi:.0f}"
+
+    # Estimate option price ~5-8% of underlying for slightly OTM
+    est_cost = price * 0.06 * 100  # per contract
+    max_risk = equity * config.RISK_MOMENTUM
+    contracts = max(1, int(max_risk / est_cost)) if est_cost > 0 else 1
+
+    setup = OptionsTradeSetup(
+        strategy=strategy,
+        underlying=underlying,
+        legs=[
+            OptionLeg(symbol="", side="buy", option_type=option_type,
+                      strike=strike, expiration=expiration),
+        ],
+        max_profit=est_cost * 2,  # target 100% gain
+        max_loss=est_cost,         # can lose entire premium
+        breakeven_low=strike - (est_cost / 100) if option_type == "put" else 0,
+        breakeven_high=strike + (est_cost / 100) if option_type == "call" else 0,
+        probability_of_profit=0.40,  # speculative — lower prob but higher payoff
+        risk_reward_ratio=2.0,       # targeting 2:1
+        target_dte=dte,
+        contracts=contracts,
+        risk_budget=config.RISK_MOMENTUM,
+        reason=f"{label} | ${strike:.0f} strike | {dte}DTE | Cost ~${est_cost:.0f}/contract",
+    )
+    # Score: momentum gets a moderate score — not as reliable as premium selling
+    rsi_quality = 0.3 if 50 <= rsi <= 70 else 0.15
+    setup.score = 0.35 + rsi_quality + (0.1 if vix < 25 else 0)
+    return setup
+
+
+def build_calendar_spread(
+    underlying: str,
+    price: float,
+    vix: float,
+    near_dte: int,
+    far_dte: int,
+    near_exp: str,
+    far_exp: str,
+    equity: float,
+) -> Optional[OptionsTradeSetup]:
+    """
+    Calendar Spread: sell near-term option, buy same-strike further out.
+    Profits from time decay differential (near decays faster).
+    Best when IV term structure is steep (near IV >> far IV).
+    """
+    inc = _strike_increment(price)
+    # ATM strike for max theta differential
+    strike = round_to_strike(price, inc)
+
+    # Use puts if price is slightly above strike, calls if below (stay neutral)
+    option_type = "call" if price >= strike else "put"
+
+    # Estimate: near-term option worth less, far-term worth more
+    near_cost = price * 0.03 * 100  # rough near-term premium
+    far_cost = price * 0.05 * 100   # rough far-term premium
+    net_debit = far_cost - near_cost  # what we pay
+
+    if net_debit <= 0:
+        return None
+
+    max_loss = net_debit  # can lose entire debit
+    max_profit = net_debit * 1.5  # rough target — profit if near expires worthless
+    contracts = size_contracts(max_loss, equity, config.RISK_CALENDAR)
+
+    setup = OptionsTradeSetup(
+        strategy=StrategyType.CALENDAR_SPREAD,
+        underlying=underlying,
+        legs=[
+            OptionLeg(symbol="", side="sell", option_type=option_type,
+                      strike=strike, expiration=near_exp),
+            OptionLeg(symbol="", side="buy", option_type=option_type,
+                      strike=strike, expiration=far_exp),
+        ],
+        max_profit=max_profit,
+        max_loss=max_loss,
+        breakeven_low=strike - (net_debit / 100),
+        breakeven_high=strike + (net_debit / 100),
+        probability_of_profit=0.55,
+        risk_reward_ratio=max_profit / max_loss if max_loss > 0 else 0,
+        target_dte=near_dte,
+        contracts=contracts,
+        risk_budget=config.RISK_CALENDAR,
+        reason=(
+            f"Calendar Spread on {underlying} | ${strike:.0f} strike | "
+            f"Sell {near_dte}DTE / Buy {far_dte}DTE | "
+            f"Theta decay play — near expires first"
+        ),
+    )
+    setup.score = _score_setup(0.55, setup.risk_reward_ratio, vix_bonus=False)
+    return setup
+
+
+def build_butterfly(
+    underlying: str,
+    price: float,
+    vix: float,
+    dte: int,
+    expiration: str,
+    equity: float,
+    spread_width: float = None,
+) -> Optional[OptionsTradeSetup]:
+    """
+    Butterfly Spread: cheap defined-risk bet that price pins near a target.
+    Buy 1 lower, sell 2 middle, buy 1 upper.
+    Best in low-vol near round numbers.
+    """
+    if spread_width is None:
+        spread_width = config.BF_SPREAD_WIDTH
+    inc = _strike_increment(price)
+
+    # Center on nearest round number
+    center = round_to_strike(price, inc)
+    lower = center - spread_width
+    upper = center + spread_width
+
+    # Use calls (doesn't matter much for butterfly payoff)
+    est_debit = spread_width * 0.20 * 100  # butterflies are cheap
+    max_profit = (spread_width * 100) - est_debit
+    max_loss = est_debit
+
+    if max_loss <= 0:
+        return None
+
+    contracts = size_contracts(max_loss, equity, config.RISK_BUTTERFLY)
+
+    setup = OptionsTradeSetup(
+        strategy=StrategyType.BUTTERFLY,
+        underlying=underlying,
+        legs=[
+            OptionLeg(symbol="", side="buy", option_type="call",
+                      strike=lower, expiration=expiration),
+            OptionLeg(symbol="", side="sell", option_type="call",
+                      strike=center, expiration=expiration, quantity=2),
+            OptionLeg(symbol="", side="buy", option_type="call",
+                      strike=upper, expiration=expiration),
+        ],
+        max_profit=max_profit,
+        max_loss=max_loss,
+        breakeven_low=lower + (est_debit / 100),
+        breakeven_high=upper - (est_debit / 100),
+        probability_of_profit=0.30,  # low prob, high payoff
+        risk_reward_ratio=max_profit / max_loss if max_loss > 0 else 0,
+        target_dte=dte,
+        contracts=contracts,
+        risk_budget=config.RISK_BUTTERFLY,
+        reason=(
+            f"Butterfly on {underlying} | Center ${center:.0f} (near round number) | "
+            f"Low vol pinning bet | {dte}DTE | "
+            f"Cheap entry: ~${est_debit:.0f}/contract"
+        ),
+    )
+    setup.score = 0.25 + (0.15 if is_near_round_number(price) else 0) + (0.1 if vix < 18 else 0)
+    return setup
+
+
+def build_earnings_strangle(
+    underlying: str,
+    price: float,
+    vix: float,
+    dte: int,
+    expiration: str,
+    iv_rank: float,
+    equity: float,
+) -> Optional[OptionsTradeSetup]:
+    """
+    Sell strangle before earnings when IV rank is high (>70%).
+    Sell OTM put + OTM call. Profit from IV crush after announcement.
+    MUST close before actual earnings — only capture the IV deflation.
+    """
+    if iv_rank < config.EARN_MIN_IV_RANK:
+        return None
+
+    inc = _strike_increment(price)
+    move = _expected_move(price, vix, dte)
+
+    # Place short strikes at ~1.2 SD (wider to survive any pre-earnings drift)
+    offset = move * 1.2
+    put_strike = round_to_strike(price - offset, inc)
+    call_strike = round_to_strike(price + offset, inc)
+
+    if put_strike >= price or call_strike <= price:
+        return None
+
+    # High IV → fat premiums
+    est_put_prem = price * 0.025 * 100
+    est_call_prem = price * 0.025 * 100
+    total_premium = est_put_prem + est_call_prem
+
+    # Undefined risk on paper, but we cap it mentally
+    # Max loss estimate: 3x premium (worst case before we'd close)
+    est_max_loss = total_premium * 3
+    contracts = size_contracts(est_max_loss, equity, config.RISK_EARNINGS)
+
+    setup = OptionsTradeSetup(
+        strategy=StrategyType.EARNINGS_STRANGLE,
+        underlying=underlying,
+        legs=[
+            OptionLeg(symbol="", side="sell", option_type="put",
+                      strike=put_strike, expiration=expiration),
+            OptionLeg(symbol="", side="sell", option_type="call",
+                      strike=call_strike, expiration=expiration),
+        ],
+        max_profit=total_premium,
+        max_loss=est_max_loss,
+        breakeven_low=put_strike - (total_premium / 100),
+        breakeven_high=call_strike + (total_premium / 100),
+        probability_of_profit=0.60,
+        risk_reward_ratio=total_premium / est_max_loss if est_max_loss > 0 else 0,
+        target_dte=dte,
+        contracts=contracts,
+        risk_budget=config.RISK_EARNINGS,
+        reason=(
+            f"Earnings Strangle on {underlying} | IV Rank={iv_rank:.0%} (elevated) | "
+            f"Sell ${put_strike:.0f}P / ${call_strike:.0f}C | {dte}DTE | "
+            f"CLOSE BEFORE ANNOUNCEMENT — capture IV crush only"
+        ),
+    )
+    setup.score = 0.40 + (0.2 if iv_rank > 0.80 else 0.1) + (0.1 if vix > 18 else 0)
+    return setup
+
+
+# ═══════════════════════════════════════════════════════════════
+# Scoring Helper
+# ═══════════════════════════════════════════════════════════════
+
+def _score_setup(
+    prob: float,
+    rr_ratio: float,
+    vix_bonus: bool = False,
+    trend_bonus: bool = False,
+) -> float:
+    """Unified scoring: probability + risk/reward + condition bonuses."""
+    score = (
+        prob * 0.40 +
+        min(rr_ratio, 1.0) * 0.30 +
+        (0.20 if vix_bonus else 0.0) +
+        (0.15 if trend_bonus else 0.0)
+    )
+    return min(score, 1.0)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -435,110 +699,181 @@ def build_wheel_csp(
 
 def select_strategy(
     market_data: dict,
-    max_capital: float,
+    equity: float,
     existing_positions: list = None,
 ) -> list:
     """
-    Master strategy selector. Analyzes market conditions and returns
-    ranked list of trade setups to consider.
+    Master strategy selector. Scans ALL tickers across ALL strategies,
+    scores every viable setup, and returns the top 5.
 
-    market_data should contain:
-        - spy_price: float (current SPY price)
-        - vix: float (current VIX level)
-        - ema_20: float (20-period EMA of SPY)
-        - ema_50: float (50-period EMA of SPY)
-        - recent_prices: list[float] (last 20+ closes)
-        - available_expirations: list[str] (available option expiration dates)
-        - wheel_candidates: list[dict] (stocks for wheel: {symbol, price})
-
-    Returns list of OptionsTradeSetup, sorted by score (best first).
+    market_data keys:
+        vix: float
+        ticker_data: dict[str, TickerAnalysis]  — per-ticker analysis
+        available_expirations: dict[str, list[str]]  — per-ticker expiration dates
+        earnings_upcoming: list[str]  — tickers with earnings in next 14 days
     """
     existing_positions = existing_positions or []
     setups = []
 
-    spy_price = market_data["spy_price"]
-    vix = market_data["vix"]
+    vix = market_data.get("vix", 18.0)
     regime = classify_market_regime(vix)
-    trend = detect_trend(
-        market_data["recent_prices"],
-        market_data["ema_20"],
-        market_data["ema_50"],
-    )
-    expirations = market_data.get("available_expirations", [])
+    ticker_data = market_data.get("ticker_data", {})
+    expirations_map = market_data.get("available_expirations", {})
+    earnings_tickers = set(market_data.get("earnings_upcoming", []))
 
-    # ── High Volatility: Iron Condors are king ──
+    now = datetime.now()
+    current_hour = now.hour
+
+    # Track which underlyings already have open positions
+    open_underlyings = set()
+    for pos in existing_positions:
+        if pos.get("status") == "open":
+            open_underlyings.add(pos.get("underlying", ""))
+
+    # ── 1. Iron Condors — ETFs only, VIX > 20 ──
     if regime == MarketRegime.HIGH_VOL:
-        # 0-3 DTE iron condors on SPY — use $5 wide wings for better premium
-        # Skip 0DTE after 11 AM ET — not enough theta left to sell
-        now_et = datetime.now()
-        for exp in expirations:
-            dte = _days_to_expiration(exp)
-            if dte == 0 and now_et.hour >= 11:
-                continue  # too late for 0DTE
-            if 0 <= dte <= 3:
-                ic = build_iron_condor(
-                    "SPY", spy_price, vix, dte, exp,
-                    max_capital, spread_width=5.0, strike_increment=1.0,
-                )
+        for sym in config.ETF_UNIVERSE:
+            if sym in open_underlyings:
+                continue
+            td = ticker_data.get(sym)
+            if not td:
+                continue
+            exps = expirations_map.get(sym, [])
+            for exp in exps:
+                dte = _days_to_expiration(exp)
+                if not (config.IC_TARGET_DTE_MIN <= dte <= config.IC_TARGET_DTE_MAX):
+                    continue
+                # Skip 0DTE after 11 AM ET
+                if dte == 0 and current_hour >= 11:
+                    continue
+                ic = build_iron_condor(sym, td.price, vix, dte, exp, equity)
                 if ic:
                     setups.append(ic)
 
-        # Also consider directional credit spreads if there's a trend
-        if trend != TrendDirection.NEUTRAL:
-            for exp in expirations:
-                dte = _days_to_expiration(exp)
-                if 5 <= dte <= 14:
-                    cs = build_credit_spread(
-                        "SPY", spy_price, vix, dte, exp, trend,
-                        max_capital, spread_width=5.0, strike_increment=1.0,
-                    )
-                    if cs:
-                        cs.score *= 0.8  # slightly penalize vs IC in high vol
-                        setups.append(cs)
-
-    # ── Medium Volatility: Credit Spreads with trend ──
-    elif regime == MarketRegime.MEDIUM_VOL:
-        # Prefer directional credit spreads
-        for exp in expirations:
+    # ── 2. Credit Spreads — ETFs + high-vol stocks, need trend ──
+    cs_tickers = config.ETF_UNIVERSE + config.STOCK_UNIVERSE
+    for sym in cs_tickers:
+        if sym in open_underlyings:
+            continue
+        td = ticker_data.get(sym)
+        if not td or td.trend == TrendDirection.NEUTRAL:
+            continue
+        exps = expirations_map.get(sym, [])
+        for exp in exps:
             dte = _days_to_expiration(exp)
-            if 3 <= dte <= 14:
-                if trend != TrendDirection.NEUTRAL:
-                    cs = build_credit_spread(
-                        "SPY", spy_price, vix, dte, exp, trend,
-                        max_capital, spread_width=5.0, strike_increment=1.0,
-                    )
-                    if cs:
-                        setups.append(cs)
-                else:
-                    # No clear trend — small iron condor
-                    ic = build_iron_condor(
-                        "SPY", spy_price, vix, dte, exp,
-                        max_capital, spread_width=3.0, strike_increment=1.0,
-                    )
-                    if ic:
-                        ic.score *= 0.7  # not ideal conditions for IC
-                        setups.append(ic)
-
-    # ── Low Volatility: Wheel on cheap stocks ──
-    if regime == MarketRegime.LOW_VOL or not setups:
-        wheel_stocks = market_data.get("wheel_candidates", [])
-        for stock in wheel_stocks:
-            # Skip if we already have a position in this stock
-            if any(p.get("symbol") == stock["symbol"] for p in existing_positions):
+            if not (config.CS_TARGET_DTE_MIN <= dte <= config.CS_TARGET_DTE_MAX):
                 continue
-            for exp in expirations:
-                dte = _days_to_expiration(exp)
-                if 14 <= dte <= 45:  # Wheel uses longer DTE
-                    csp = build_wheel_csp(
-                        stock["symbol"], stock["price"], vix, dte, exp,
-                        max_capital, strike_increment=0.5,
-                    )
-                    if csp:
-                        setups.append(csp)
+            cs = build_credit_spread(
+                sym, td.price, vix, dte, exp, td.trend, equity
+            )
+            if cs:
+                # Penalize slightly in high-vol vs iron condors
+                if regime == MarketRegime.HIGH_VOL:
+                    cs.score *= 0.85
+                setups.append(cs)
 
-    # Sort by score (best first) and return top candidates
+    # ── 3. Wheel (CSP) — cheap stocks, low VIX ──
+    if regime == MarketRegime.LOW_VOL or vix < config.WHEEL_MAX_VIX + 3:
+        for sym in config.WHEEL_STOCKS:
+            if sym in open_underlyings:
+                continue
+            td = ticker_data.get(sym)
+            if not td:
+                continue
+            exps = expirations_map.get(sym, [])
+            for exp in exps:
+                dte = _days_to_expiration(exp)
+                if not (config.WHEEL_TARGET_DTE_MIN <= dte <= config.WHEEL_TARGET_DTE_MAX):
+                    continue
+                csp = build_wheel_csp(sym, td.price, vix, dte, exp, equity)
+                if csp:
+                    # Bonus in low vol
+                    if regime == MarketRegime.LOW_VOL:
+                        csp.score += 0.15
+                    setups.append(csp)
+
+    # ── 4. Momentum Calls/Puts — individual stocks with breakout/breakdown ──
+    for sym in config.STOCK_UNIVERSE:
+        if sym in open_underlyings:
+            continue
+        td = ticker_data.get(sym)
+        if not td or td.trend == TrendDirection.NEUTRAL:
+            continue
+        exps = expirations_map.get(sym, [])
+        for exp in exps:
+            dte = _days_to_expiration(exp)
+            if not (config.MOM_TARGET_DTE_MIN <= dte <= config.MOM_TARGET_DTE_MAX):
+                continue
+            mom = build_momentum_trade(
+                sym, td.price, vix, dte, exp, td.trend, td.rsi, equity
+            )
+            if mom:
+                setups.append(mom)
+            break  # one expiration per ticker for momentum
+
+    # ── 5. Calendar Spreads — any ticker, need near + far expirations ──
+    all_tickers = config.ETF_UNIVERSE + config.STOCK_UNIVERSE
+    for sym in all_tickers:
+        if sym in open_underlyings:
+            continue
+        td = ticker_data.get(sym)
+        if not td:
+            continue
+        exps = expirations_map.get(sym, [])
+        near_exps = [(exp, _days_to_expiration(exp)) for exp in exps
+                     if config.CAL_NEAR_DTE_MIN <= _days_to_expiration(exp) <= config.CAL_NEAR_DTE_MAX]
+        far_exps = [(exp, _days_to_expiration(exp)) for exp in exps
+                    if config.CAL_FAR_DTE_MIN <= _days_to_expiration(exp) <= config.CAL_FAR_DTE_MAX]
+        if near_exps and far_exps:
+            near_exp, near_dte = near_exps[0]
+            far_exp, far_dte = far_exps[0]
+            cal = build_calendar_spread(
+                sym, td.price, vix, near_dte, far_dte, near_exp, far_exp, equity
+            )
+            if cal:
+                setups.append(cal)
+
+    # ── 6. Butterfly Spreads — ETFs + stocks near round numbers, low vol ──
+    if regime in (MarketRegime.LOW_VOL, MarketRegime.MEDIUM_VOL):
+        bf_tickers = config.ETF_UNIVERSE + config.STOCK_UNIVERSE
+        for sym in bf_tickers:
+            if sym in open_underlyings:
+                continue
+            td = ticker_data.get(sym)
+            if not td or not td.near_round_number:
+                continue
+            exps = expirations_map.get(sym, [])
+            for exp in exps:
+                dte = _days_to_expiration(exp)
+                if not (config.BF_TARGET_DTE_MIN <= dte <= config.BF_TARGET_DTE_MAX):
+                    continue
+                bf = build_butterfly(sym, td.price, vix, dte, exp, equity)
+                if bf:
+                    setups.append(bf)
+                break  # one per ticker
+
+    # ── 7. Earnings Strangles — stocks with upcoming earnings + high IV rank ──
+    for sym in earnings_tickers:
+        if sym in open_underlyings:
+            continue
+        td = ticker_data.get(sym)
+        if not td or td.iv_rank < config.EARN_MIN_IV_RANK:
+            continue
+        exps = expirations_map.get(sym, [])
+        for exp in exps:
+            dte = _days_to_expiration(exp)
+            if not (config.EARN_TARGET_DTE_MIN <= dte <= config.EARN_TARGET_DTE_MAX):
+                continue
+            es = build_earnings_strangle(
+                sym, td.price, vix, dte, exp, td.iv_rank, equity
+            )
+            if es:
+                setups.append(es)
+            break  # one per ticker
+
+    # Sort by score (best first) and return top 5
     setups.sort(key=lambda s: s.score, reverse=True)
-    return setups[:5]  # return top 5 setups
+    return setups[:5]
 
 
 def _days_to_expiration(exp_date_str: str) -> int:
@@ -566,52 +901,83 @@ def should_close_position(
 
     Returns (should_close: bool, reason: str)
 
-    Rules:
-    1. Take profit at 50% of max profit (standard for premium selling)
-    2. Cut loss at 2x premium received (max loss management)
-    3. Close at 1 DTE to avoid assignment risk (except wheel)
-    4. Close if VIX spikes >30% from entry (volatility expansion danger)
+    Universal rules applied first, then strategy-specific rules.
     """
     strategy = position.get("strategy", "")
 
-    # Rule 1: Take profit at 50%
-    if current_pnl_pct >= 0.50:
-        return True, f"Take profit: {current_pnl_pct:.0%} of max profit reached"
+    # ── Strategy-specific profit targets and stop losses ──
+    profit_target, stop_loss = _get_exit_params(strategy)
 
-    # Rule 2: Cut loss at 200% of premium (lose 2x what you collected)
-    if current_pnl_pct <= -2.0:
-        return True, f"Stop loss: losing {abs(current_pnl_pct):.0%} of premium collected"
+    # Rule 1: Take profit
+    if current_pnl_pct >= profit_target:
+        return True, f"Take profit: {current_pnl_pct:.0%} of max profit reached (target: {profit_target:.0%})"
 
-    # Rule 3: Close before expiration (avoid assignment)
-    if strategy != StrategyType.CASH_SECURED_PUT.value:
+    # Rule 2: Stop loss
+    if current_pnl_pct <= -stop_loss:
+        return True, f"Stop loss: losing {abs(current_pnl_pct):.0%} of premium (limit: {stop_loss:.0%})"
+
+    # Rule 3: Close before expiration — avoid assignment (except wheel CSPs)
+    if strategy not in (StrategyType.CASH_SECURED_PUT.value, "cash_secured_put"):
         if dte_remaining <= 1:
             return True, f"Closing: {dte_remaining} DTE remaining, avoiding assignment risk"
 
-    # Rule 4: Volatility spike
+    # Rule 4: Volatility spike — danger for short premium positions
     entry_vix = position.get("entry_vix", vix_current)
-    if vix_current > entry_vix * 1.30:
-        return True, f"Vol spike: VIX rose from {entry_vix:.1f} to {vix_current:.1f} (+{((vix_current/entry_vix)-1)*100:.0f}%)"
+    if strategy in ("iron_condor", "bull_put_spread", "bear_call_spread", "earnings_strangle"):
+        if vix_current > entry_vix * 1.30:
+            return True, (
+                f"Vol spike: VIX rose from {entry_vix:.1f} to {vix_current:.1f} "
+                f"(+{((vix_current / entry_vix) - 1) * 100:.0f}%) — dangerous for short premium"
+            )
+
+    # Rule 5: Momentum trades — cut losers faster, let winners run
+    if strategy in ("long_call", "long_put"):
+        if current_pnl_pct <= -0.50:
+            return True, f"Momentum stop: lost {abs(current_pnl_pct):.0%} of entry cost"
+
+    # Rule 6: Earnings strangles — close before announcement day
+    if strategy == "earnings_strangle":
+        if dte_remaining <= 1:
+            return True, "Earnings strangle: closing before announcement (event risk)"
 
     return False, ""
+
+
+def _get_exit_params(strategy: str) -> tuple:
+    """Return (profit_target, stop_loss_multiplier) for a strategy."""
+    params = {
+        "iron_condor":      (config.IC_PROFIT_TARGET, config.IC_STOP_LOSS),
+        "bull_put_spread":  (config.CS_PROFIT_TARGET, config.CS_STOP_LOSS),
+        "bear_call_spread": (config.CS_PROFIT_TARGET, config.CS_STOP_LOSS),
+        "cash_secured_put": (config.WHEEL_PROFIT_TARGET, config.WHEEL_STOP_LOSS),
+        "covered_call":     (0.50, 1.5),
+        "long_call":        (config.MOM_PROFIT_TARGET, config.MOM_STOP_LOSS),
+        "long_put":         (config.MOM_PROFIT_TARGET, config.MOM_STOP_LOSS),
+        "calendar_spread":  (config.CAL_PROFIT_TARGET, config.CAL_STOP_LOSS),
+        "butterfly":        (config.BF_PROFIT_TARGET, config.BF_STOP_LOSS),
+        "earnings_strangle": (config.EARN_PROFIT_TARGET, config.EARN_STOP_LOSS),
+    }
+    return params.get(strategy, (0.50, 2.0))
 
 
 def calculate_position_risk(setup: OptionsTradeSetup, account_equity: float) -> dict:
     """
     Calculate risk metrics for a potential trade.
-
-    Returns dict with risk assessment and whether to proceed.
+    Uses the strategy-specific risk budget instead of a flat 5%.
     """
     total_max_loss = setup.max_loss * setup.contracts
     risk_pct = total_max_loss / account_equity if account_equity > 0 else 1.0
+    max_allowed = setup.risk_budget if setup.risk_budget > 0 else 0.05
 
     return {
         "total_max_loss": total_max_loss,
         "risk_pct_of_equity": risk_pct,
+        "max_allowed_pct": max_allowed,
         "contracts": setup.contracts,
-        "approved": risk_pct <= 0.05,  # never risk more than 5% of equity on one trade
+        "approved": risk_pct <= max_allowed,
         "reason": (
             f"Risk: ${total_max_loss:.0f} ({risk_pct:.1%} of equity) — "
-            f"{'APPROVED' if risk_pct <= 0.05 else 'REJECTED: exceeds 5% max risk'}"
+            f"{'APPROVED' if risk_pct <= max_allowed else f'REJECTED: exceeds {max_allowed:.0%} max risk for {setup.strategy.value}'}"
         ),
     }
 
@@ -620,21 +986,37 @@ def calculate_position_risk(setup: OptionsTradeSetup, account_equity: float) -> 
 # Formatting Helpers
 # ═══════════════════════════════════════════════════════════════
 
+STRATEGY_EMOJI = {
+    "iron_condor": "🦅",
+    "bull_put_spread": "🐂",
+    "bear_call_spread": "🐻",
+    "cash_secured_put": "🎡",
+    "covered_call": "📞",
+    "long_call": "🚀",
+    "long_put": "💣",
+    "calendar_spread": "📅",
+    "butterfly": "🦋",
+    "earnings_strangle": "📊",
+}
+
+
 def format_setup_summary(setup: OptionsTradeSetup) -> str:
     """Human-readable summary of a trade setup."""
+    emoji = STRATEGY_EMOJI.get(setup.strategy.value, "📋")
     lines = [
-        f"{'═' * 45}",
-        f"📋 {setup.strategy.value.upper().replace('_', ' ')}",
-        f"{'═' * 45}",
+        f"{'═' * 50}",
+        f"{emoji} {setup.strategy.value.upper().replace('_', ' ')}",
+        f"{'═' * 50}",
         f"Underlying: {setup.underlying}",
         f"Contracts: {setup.contracts}",
     ]
 
     for leg in setup.legs:
         side_emoji = "🔴" if leg.side == "sell" else "🟢"
+        qty_str = f" x{leg.quantity}" if leg.quantity > 1 else ""
         lines.append(
             f"  {side_emoji} {leg.side.upper()} {leg.option_type.upper()} "
-            f"${leg.strike:.0f} exp {leg.expiration}"
+            f"${leg.strike:.0f} exp {leg.expiration}{qty_str}"
         )
 
     lines.extend([
@@ -642,6 +1024,7 @@ def format_setup_summary(setup: OptionsTradeSetup) -> str:
         f"Max Loss:   ${setup.max_loss:.0f}/contract (${setup.max_loss * setup.contracts:.0f} total)",
         f"Prob of Profit: ~{setup.probability_of_profit:.0%}",
         f"Risk/Reward: 1:{setup.risk_reward_ratio:.2f}",
+        f"Risk Budget: {setup.risk_budget:.0%} of equity",
         f"Score: {setup.score:.2f}",
         f"Reason: {setup.reason}",
     ])

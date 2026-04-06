@@ -5,3 +5,5 @@ __pycache__/
 briefings/
 reviews/
 approved_trades.json
+bot.pid
+pending_trades.json
