@@ -43,7 +43,7 @@ from options_strategies import (
     StrategyType, MarketRegime, TrendDirection,
     OptionLeg, OptionsTradeSetup, TickerAnalysis,
     classify_market_regime, detect_trend, compute_rsi,
-    is_near_round_number, select_strategy,
+    is_near_round_number, select_strategy, _score_setup,
     should_close_position, calculate_position_risk, format_setup_summary,
 )
 from telegram_alerts import TelegramAlerts
@@ -168,28 +168,46 @@ class AlpacaBotOptions:
 
     def get_vix(self) -> float:
         """
-        Estimate VIX from VIXY ETF price.
-        VIXY tracks VIX short-term futures. Piecewise linear approximation.
+        Get real VIX value. Tries multiple sources in order:
+        1. yfinance ^VIX (most accurate — actual CBOE VIX index)
+        2. VIXY ETF proxy (fallback)
+        3. Default 18.0 (last resort)
         """
+        # Source 1: Real VIX via yfinance
+        try:
+            import yfinance as yf
+            vix_ticker = yf.Ticker("^VIX")
+            hist = vix_ticker.history(period="1d")
+            if not hist.empty:
+                vix_val = float(hist["Close"].iloc[-1])
+                vix_val = max(9.0, min(90.0, vix_val))
+                log.info(f"VIX (yfinance): {vix_val:.2f}")
+                return vix_val
+        except Exception as e:
+            log.warning(f"yfinance VIX fetch failed: {e}")
+
+        # Source 2: VIXY ETF proxy (less accurate but available via Alpaca)
         try:
             request = StockLatestBarRequest(symbol_or_symbols="VIXY")
             bars = self.stock_data.get_stock_latest_bar(request)
             if "VIXY" in bars:
                 vixy = float(bars["VIXY"].close)
+                # Improved mapping based on historical VIXY/VIX correlation
                 if vixy < 20:
-                    vix_est = 10 + (vixy - 15) * 0.6
+                    vix_est = 12 + (vixy - 15) * 0.8
                 elif vixy < 35:
-                    vix_est = 15 + (vixy - 20) * 0.67
+                    vix_est = 16 + (vixy - 20) * 0.6
                 elif vixy < 55:
                     vix_est = 25 + (vixy - 35) * 0.5
                 else:
-                    vix_est = 35 + (vixy - 55) * 0.4
+                    vix_est = 35 + (vixy - 55) * 0.3
                 vix_est = max(10.0, min(80.0, vix_est))
-                log.info(f"VIXY=${vixy:.2f} → VIX estimate={vix_est:.1f}")
+                log.info(f"VIX (VIXY proxy): VIXY=${vixy:.2f} → est={vix_est:.1f}")
                 return vix_est
         except Exception:
             pass
-        log.warning("Could not fetch VIX proxy. Using default VIX=18")
+
+        log.warning("Could not fetch VIX from any source. Using default VIX=18")
         return 18.0
 
     def get_ticker_analysis(self, symbol: str) -> TickerAnalysis:
@@ -894,13 +912,32 @@ class AlpacaBotOptions:
         for i, s in enumerate(setups, 1):
             log.info(f"  #{i}: {s.strategy.value} on {s.underlying} — score={s.score:.2f}")
 
-        # 11. Resolve option symbols and get real quotes
+        # 11. Resolve option symbols, get real quotes, and RE-SCORE with real data
+        #     The initial scoring uses estimated premiums. Real quotes can change
+        #     the picture completely — a trade that looked good on paper might have
+        #     terrible bid/ask spread or no liquidity.
         resolved_setups = []
-        for setup in setups[:3]:
+        for setup in setups[:5]:  # resolve top 5, then re-rank to pick best 3
             setup = self.resolve_option_symbols(setup)
             if setup.legs:
                 self._recalculate_with_real_quotes(setup)
+                # Liquidity filter: skip if any leg has 0 premium (no market)
+                if any(l.premium == 0 for l in setup.legs):
+                    log.info(f"  Skipping {setup.strategy.value} {setup.underlying} — no liquidity (zero premium)")
+                    continue
+                # Bid/ask spread filter: skip if spread is >50% of mid price on any leg
+                for leg in setup.legs:
+                    quote = self.get_option_quote(leg.symbol)
+                    if quote["mid"] > 0:
+                        spread_pct = (quote["ask"] - quote["bid"]) / quote["mid"]
+                        if spread_pct > 0.50:
+                            log.info(f"  Wide bid/ask on {leg.symbol}: {spread_pct:.0%} — penalizing score")
+                            setup.score *= 0.80  # penalize illiquid options
             resolved_setups.append(setup)
+
+        # Re-rank after real quotes — the order may have changed
+        resolved_setups.sort(key=lambda s: s.score, reverse=True)
+        resolved_setups = resolved_setups[:3]  # top 3 after real quote re-ranking
 
         # 12. Build proposals for Claude review
         proposals = self._build_proposals(resolved_setups)
@@ -1006,21 +1043,35 @@ class AlpacaBotOptions:
         return sig
 
     def _recalculate_with_real_quotes(self, setup: OptionsTradeSetup):
-        """Recalculate P&L metrics using real option quotes."""
+        """
+        Recalculate P&L metrics AND re-score using real option quotes.
+        This is where fantasy meets reality — estimated premiums get replaced
+        with actual bid/ask data, and the score is recalculated to reflect truth.
+        """
+        from options_strategies import _score_setup
+
         sell_premium = sum(l.premium * l.quantity for l in setup.legs if l.side == "sell")
         buy_premium = sum(l.premium * l.quantity for l in setup.legs if l.side == "buy")
         real_premium = sell_premium - buy_premium
 
-        if real_premium > 0 and setup.strategy.value in (
+        credit_strategies = (
             "iron_condor", "bull_put_spread", "bear_call_spread", "earnings_strangle"
-        ):
+        )
+        debit_strategies = (
+            "long_call", "long_put", "calendar_spread", "butterfly",
+            "bull_call_spread", "bear_put_spread",
+        )
+
+        if real_premium > 0 and setup.strategy.value in credit_strategies:
             setup.max_profit = real_premium * 100
 
             if setup.strategy == StrategyType.IRON_CONDOR and len(setup.legs) >= 4:
+                # Fix: calculate max loss per SIDE, not cross-product
                 put_legs = sorted([l for l in setup.legs if l.option_type == "put"], key=lambda l: l.strike)
                 call_legs = sorted([l for l in setup.legs if l.option_type == "call"], key=lambda l: l.strike)
                 put_width = abs(put_legs[-1].strike - put_legs[0].strike) if len(put_legs) == 2 else 5
                 call_width = abs(call_legs[-1].strike - call_legs[0].strike) if len(call_legs) == 2 else 5
+                # Max loss is the WIDER side minus total premium collected
                 spread_width = max(put_width, call_width)
                 setup.max_loss = (spread_width * 100) - setup.max_profit
             elif setup.strategy in (StrategyType.BULL_PUT_SPREAD, StrategyType.BEAR_CALL_SPREAD):
@@ -1029,14 +1080,39 @@ class AlpacaBotOptions:
 
             setup.risk_reward_ratio = setup.max_profit / setup.max_loss if setup.max_loss > 0 else 0
 
-        elif real_premium < 0 and setup.strategy.value in (
-            "long_call", "long_put", "calendar_spread", "butterfly"
-        ):
-            # Debit trades: cost is what we pay
-            setup.max_loss = abs(real_premium) * 100
+        elif real_premium < 0 and setup.strategy.value in debit_strategies:
+            # Debit trades: cost is net debit paid
+            net_debit = abs(real_premium) * 100
+            setup.max_loss = net_debit
+            if setup.strategy.value in ("bull_call_spread", "bear_put_spread"):
+                spread_width = abs(setup.legs[0].strike - setup.legs[1].strike)
+                setup.max_profit = (spread_width * 100) - net_debit
             setup.risk_reward_ratio = setup.max_profit / setup.max_loss if setup.max_loss > 0 else 0
 
-        # Re-cap position size after real quotes — enforce hard 5% equity limit
+        elif real_premium == 0:
+            log.warning(f"Zero net premium on {setup.strategy.value} {setup.underlying} — quotes may be stale")
+
+        # Re-score with real numbers instead of estimates
+        if setup.max_loss > 0 and setup.max_profit > 0:
+            real_rr = setup.risk_reward_ratio
+            # Keep original PoP estimate (can't easily get real delta from quotes)
+            setup.score = _score_setup(
+                setup.probability_of_profit,
+                real_rr,
+                vix_bonus=(self._last_vix > 20),
+                trend_bonus=(setup.strategy.value in (
+                    "bull_put_spread", "bear_call_spread",
+                    "bull_call_spread", "bear_put_spread",
+                    "long_call", "long_put",
+                )),
+            )
+            log.info(
+                f"  Re-scored {setup.strategy.value} {setup.underlying}: "
+                f"profit=${setup.max_profit:.0f} loss=${setup.max_loss:.0f} "
+                f"R:R={real_rr:.2f} → score={setup.score:.3f}"
+            )
+
+        # Re-cap position size after real quotes — enforce hard equity limit
         if setup.max_loss > 0:
             account = self.get_account_info()
             max_risk = account["equity"] * setup.risk_budget
@@ -1244,10 +1320,14 @@ class AlpacaBotOptions:
 
         # Strategy priorities based on regime
         if regime == MarketRegime.HIGH_VOL:
-            lines.append(f"• VIX elevated ({vix:.1f}) — premium selling is attractive")
-            lines.append(f"• Priority: Iron condors on ETFs ({', '.join(config.ETF_UNIVERSE)})")
-            if trend != TrendDirection.NEUTRAL:
-                lines.append(f"• Also scanning: {trend.value} credit spreads on stocks")
+            lines.append(f"• VIX elevated ({vix:.1f}) — premium selling attractive if range-bound")
+            if trend == TrendDirection.NEUTRAL:
+                lines.append(f"• Priority: Iron condors on ETFs ({', '.join(config.ETF_UNIVERSE)})")
+            else:
+                lines.append(f"• Trend detected: {trend.value} — debit spreads + credit spreads WITH trend")
+                lines.append(f"• Bull call spreads (bullish) or bear put spreads (bearish) for directional plays")
+                lines.append(f"• Iron condors only if range tightens")
+            lines.append(f"• Momentum plays on strong movers — high vol = bigger moves")
             lines.append(f"• Earnings strangles if any high-IV names upcoming")
         elif regime == MarketRegime.MEDIUM_VOL:
             if trend != TrendDirection.NEUTRAL:

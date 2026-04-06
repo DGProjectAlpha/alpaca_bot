@@ -30,6 +30,8 @@ class StrategyType(Enum):
     IRON_CONDOR = "iron_condor"
     BULL_PUT_SPREAD = "bull_put_spread"
     BEAR_CALL_SPREAD = "bear_call_spread"
+    BULL_CALL_SPREAD = "bull_call_spread"      # Debit spread — buy lower call, sell higher
+    BEAR_PUT_SPREAD = "bear_put_spread"        # Debit spread — buy higher put, sell lower
     CASH_SECURED_PUT = "cash_secured_put"
     COVERED_CALL = "covered_call"
     LONG_CALL = "long_call"
@@ -390,6 +392,99 @@ def build_credit_spread(
     return setup
 
 
+def build_debit_spread(
+    underlying: str,
+    price: float,
+    vix: float,
+    dte: int,
+    expiration: str,
+    direction: TrendDirection,
+    equity: float,
+    spread_width: float = None,
+) -> Optional[OptionsTradeSetup]:
+    """
+    Debit Spread: buy-to-open directional spread with defined risk.
+    Bull Call Spread (bullish): buy lower call, sell higher call.
+    Bear Put Spread (bearish): buy higher put, sell lower put.
+
+    Unlike credit spreads (which profit from time decay), debit spreads
+    profit from MOVEMENT. Great in trending, volatile markets where
+    iron condors get blown up.
+
+    Cost = net debit paid. Max profit = spread width - debit. Max loss = debit.
+    """
+    if direction == TrendDirection.NEUTRAL:
+        return None
+    if spread_width is None:
+        spread_width = config.CS_SPREAD_WIDTH  # reuse credit spread width setting
+
+    inc = _strike_increment(price)
+    move = _expected_move(price, vix, dte)
+
+    if direction == TrendDirection.BULLISH:
+        # Buy ATM or slightly ITM call, sell OTM call
+        long_strike = round_to_strike(price - (move * 0.1), inc)  # slightly ITM
+        short_strike = round_to_strike(long_strike + spread_width, inc)
+        strategy = StrategyType.BULL_CALL_SPREAD
+        legs = [
+            OptionLeg(symbol="", side="buy", option_type="call",
+                      strike=long_strike, expiration=expiration),
+            OptionLeg(symbol="", side="sell", option_type="call",
+                      strike=short_strike, expiration=expiration),
+        ]
+        label = f"Bull Call Spread on {underlying} | Bullish | {long_strike}/{short_strike}C"
+    else:
+        # Buy ATM or slightly ITM put, sell OTM put
+        long_strike = round_to_strike(price + (move * 0.1), inc)  # slightly ITM
+        short_strike = round_to_strike(long_strike - spread_width, inc)
+        strategy = StrategyType.BEAR_PUT_SPREAD
+        legs = [
+            OptionLeg(symbol="", side="buy", option_type="put",
+                      strike=long_strike, expiration=expiration),
+            OptionLeg(symbol="", side="sell", option_type="put",
+                      strike=short_strike, expiration=expiration),
+        ]
+        label = f"Bear Put Spread on {underlying} | Bearish | {long_strike}/{short_strike}P"
+
+    # Estimate debit as ~60-70% of spread width (ITM component)
+    est_debit_pct = 0.65 if vix > 20 else 0.60
+    est_debit = spread_width * est_debit_pct * 100  # cost per contract
+    max_profit = (spread_width * 100) - est_debit
+    max_loss = est_debit
+
+    # Small account guard
+    if max_loss > equity * 0.05:
+        return None
+
+    contracts = size_contracts(max_loss, equity, config.RISK_CREDIT_SPREAD)
+
+    # PoP for debit spreads: ~45-55% depending on how close to ATM
+    prob = 0.50 if vix > 20 else 0.45
+    rr = max_profit / max_loss if max_loss > 0 else 0
+
+    setup = OptionsTradeSetup(
+        strategy=strategy,
+        underlying=underlying,
+        legs=legs,
+        max_profit=max_profit,
+        max_loss=max_loss,
+        breakeven_low=long_strike + (est_debit / 100) if direction == TrendDirection.BULLISH else 0,
+        breakeven_high=long_strike - (est_debit / 100) if direction == TrendDirection.BEARISH else 0,
+        probability_of_profit=prob,
+        risk_reward_ratio=rr,
+        target_dte=dte,
+        contracts=contracts,
+        risk_budget=config.RISK_CREDIT_SPREAD,
+        reason=f"{label} | {dte}DTE | VIX={vix:.1f} | Debit ~${est_debit:.0f}",
+    )
+    # Debit spreads score: moderate PoP, decent R:R, big trend bonus
+    setup.score = _score_setup(prob, rr, vix_bonus=(vix > 20), trend_bonus=True)
+    # Debit spreads LOVE high vol + trend — opposite of iron condors
+    if vix > 20 and direction != TrendDirection.NEUTRAL:
+        setup.score += 0.08
+    return setup
+
+
 def build_wheel_csp(
     underlying: str,
     price: float,
@@ -510,10 +605,14 @@ def build_momentum_trade(
         reason=f"{label} | ${strike:.0f} strike | {dte}DTE | Cost ~${est_cost:.0f}/contract",
     )
     # Momentum is speculative (40% PoP, 2:1 R:R) — score reflects that honestly
-    setup.score = _score_setup(0.40, 2.0, vix_bonus=(vix < 15), trend_bonus=True)
-    # Extra penalty in high vol — you should be selling premium, not buying it
-    if vix > 20:
-        setup.score *= 0.60
+    setup.score = _score_setup(0.40, 2.0, vix_bonus=False, trend_bonus=True)
+    # High vol: options cost more BUT moves are bigger. Mild penalty only.
+    # The old 40% penalty killed momentum in exactly the conditions it works best.
+    if vix > 25:
+        setup.score *= 0.85  # very high vol = premiums too expensive, mild penalty
+    elif vix > 20:
+        setup.score *= 0.95  # moderate-high vol = slightly more expensive, barely penalize
+    # Low vol bonus: cheap premiums, but moves are smaller — wash
     return setup
 
 
@@ -834,6 +933,30 @@ def select_strategy(
                     cs.score *= 0.85
                 setups.append(cs)
 
+    # ── 2b. Debit Spreads — trending markets, any vol ──
+    # These profit from MOVEMENT, not time decay. Great when vol is high + trending.
+    ds_tickers = config.ETF_UNIVERSE + config.STOCK_UNIVERSE
+    for sym in ds_tickers:
+        if sym in open_underlyings:
+            continue
+        td = ticker_data.get(sym)
+        if not td or td.trend == TrendDirection.NEUTRAL:
+            continue
+        exps = expirations_map.get(sym, [])
+        for exp in exps:
+            dte = _days_to_expiration(exp)
+            if not (5 <= dte <= 21):  # 5-21 DTE for debit spreads
+                continue
+            ds = build_debit_spread(
+                sym, td.price, vix, dte, exp, td.trend, equity
+            )
+            if ds:
+                # Debit spreads shine in high vol + trend (opposite of credit spreads)
+                if regime == MarketRegime.HIGH_VOL and td.trend != TrendDirection.NEUTRAL:
+                    ds.score += 0.05  # bonus: this is their best environment
+                setups.append(ds)
+            break  # one expiration per ticker
+
     # ── 3. Wheel (CSP) — cheap stocks, low VIX ──
     if regime == MarketRegime.LOW_VOL or vix < config.WHEEL_MAX_VIX + 3:
         for sym in config.WHEEL_STOCKS:
@@ -1010,8 +1133,8 @@ def should_close_position(
                 f"(+{((vix_current / entry_vix) - 1) * 100:.0f}%) — dangerous for short premium"
             )
 
-    # Rule 5: Momentum trades — cut losers faster, let winners run
-    if strategy in ("long_call", "long_put"):
+    # Rule 5: Momentum/debit trades — cut losers faster, let winners run
+    if strategy in ("long_call", "long_put", "bull_call_spread", "bear_put_spread"):
         if current_pnl_pct <= -0.50:
             return True, f"Momentum stop: lost {abs(current_pnl_pct):.0%} of entry cost"
 
@@ -1033,6 +1156,8 @@ def _get_exit_params(strategy: str) -> tuple:
         "covered_call":     (0.50, 1.5),
         "long_call":        (config.MOM_PROFIT_TARGET, config.MOM_STOP_LOSS),
         "long_put":         (config.MOM_PROFIT_TARGET, config.MOM_STOP_LOSS),
+        "bull_call_spread": (config.CS_PROFIT_TARGET, config.MOM_STOP_LOSS),  # take profit like credit, cut loss like momentum
+        "bear_put_spread":  (config.CS_PROFIT_TARGET, config.MOM_STOP_LOSS),
         "calendar_spread":  (config.CAL_PROFIT_TARGET, config.CAL_STOP_LOSS),
         "butterfly":        (config.BF_PROFIT_TARGET, config.BF_STOP_LOSS),
         "earnings_strangle": (config.EARN_PROFIT_TARGET, config.EARN_STOP_LOSS),
