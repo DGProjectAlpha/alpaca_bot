@@ -422,7 +422,7 @@ def build_wheel_csp(
             f"{dte}DTE | Would own at ${strike:.2f} if assigned"
         ),
     )
-    setup.score = 0.50  # wheel is steady but slow
+    setup.score = _score_setup(0.75, setup.risk_reward_ratio)  # wheel: high PoP, modest R:R
     return setup
 
 
@@ -487,10 +487,11 @@ def build_momentum_trade(
         risk_budget=config.RISK_MOMENTUM,
         reason=f"{label} | ${strike:.0f} strike | {dte}DTE | Cost ~${est_cost:.0f}/contract",
     )
-    # Score: momentum is speculative — penalize in high vol (should sell premium instead)
-    rsi_quality = 0.2 if 50 <= rsi <= 70 else 0.1
-    vol_penalty = -0.15 if vix > 20 else (-0.05 if vix > 15 else 0.1)
-    setup.score = 0.35 + rsi_quality + vol_penalty
+    # Momentum is speculative (40% PoP, 2:1 R:R) — score reflects that honestly
+    setup.score = _score_setup(0.40, 2.0, vix_bonus=(vix < 15), trend_bonus=True)
+    # Extra penalty in high vol — you should be selling premium, not buying it
+    if vix > 20:
+        setup.score *= 0.60
     return setup
 
 
@@ -615,7 +616,9 @@ def build_butterfly(
             f"Cheap entry: ~${est_debit:.0f}/contract"
         ),
     )
-    setup.score = 0.25 + (0.15 if is_near_round_number(price) else 0) + (0.1 if vix < 18 else 0)
+    setup.score = _score_setup(0.35, setup.risk_reward_ratio, vix_bonus=(vix < 18))
+    if is_near_round_number(price):
+        setup.score += 0.05  # slight bonus for round number pinning
     return setup
 
 
@@ -681,7 +684,9 @@ def build_earnings_strangle(
             f"CLOSE BEFORE ANNOUNCEMENT — capture IV crush only"
         ),
     )
-    setup.score = 0.40 + (0.2 if iv_rank > 0.80 else 0.1) + (0.1 if vix > 18 else 0)
+    setup.score = _score_setup(0.60, setup.risk_reward_ratio, vix_bonus=(vix > 18))
+    if iv_rank > 0.80:
+        setup.score += 0.05  # extra high IV = better crush potential
     return setup
 
 
@@ -695,13 +700,36 @@ def _score_setup(
     vix_bonus: bool = False,
     trend_bonus: bool = False,
 ) -> float:
-    """Unified scoring: probability + risk/reward + condition bonuses."""
+    """
+    Risk-adjusted scoring. Prioritizes SAFETY over raw profit.
+
+    - Probability of profit is king (50% weight)
+    - Risk/reward ratio matters but capped so it doesn't reward garbage R:R (20%)
+    - Expected value per dollar risked is the tiebreaker (15%)
+    - Condition bonuses are minor (15% max)
+
+    Hard floors:
+    - PoP < 55% → score capped at 0.30 (will never pass minimum threshold)
+    - R:R < 0.3 → score halved (risking $3 to make $1 is not worth it)
+    """
+    # Expected value: (prob × reward) - ((1-prob) × risk), normalized
+    ev_per_dollar = prob * rr_ratio - (1 - prob) * 1.0
+    ev_score = max(ev_per_dollar, 0.0)  # floor at 0
+
     score = (
-        prob * 0.40 +
-        min(rr_ratio, 1.0) * 0.30 +
-        (0.20 if vix_bonus else 0.0) +
-        (0.15 if trend_bonus else 0.0)
+        prob * 0.50 +                           # probability is king
+        min(rr_ratio, 1.5) / 1.5 * 0.20 +      # R:R capped at 1.5
+        min(ev_score, 0.5) * 0.15 +             # EV tiebreaker
+        (0.10 if vix_bonus else 0.0) +
+        (0.05 if trend_bonus else 0.0)
     )
+
+    # Hard penalties
+    if prob < 0.55:
+        score = min(score, 0.30)  # low PoP = hard cap
+    if rr_ratio < 0.3:
+        score *= 0.50             # terrible R:R = halved
+
     return min(score, 1.0)
 
 
@@ -885,9 +913,18 @@ def select_strategy(
 
     # Sort by score (best first), then diversify — max 2 of same strategy type
     setups.sort(key=lambda s: s.score, reverse=True)
+
+    # ── MINIMUM QUALITY THRESHOLD ──
+    # If nothing scores above 0.45, the market isn't offering good setups.
+    # "No trade" beats "bad trade" every single time.
+    MIN_SCORE = 0.45
+    qualified = [s for s in setups if s.score >= MIN_SCORE]
+    if not qualified:
+        return []  # nothing worth trading today — sit on hands
+
     diversified = []
     strategy_counts = {}
-    for s in setups:
+    for s in qualified:
         stype = s.strategy.value
         if strategy_counts.get(stype, 0) < 2:
             diversified.append(s)

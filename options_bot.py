@@ -772,7 +772,18 @@ class AlpacaBotOptions:
         setups = select_strategy(market_data, equity, self.active_positions)
 
         if not setups:
-            log.info("No viable setups found this scan.")
+            log.info("No viable setups found this scan — nothing above quality threshold.")
+            # Notify once per day that we're sitting out
+            today = now.strftime("%Y-%m-%d")
+            if not hasattr(self, '_no_trade_notified') or self._no_trade_notified != today:
+                self._no_trade_notified = today
+                self.alerts.send_alert(
+                    f"📊 Scanned {len(ticker_data)} tickers × 7 strategies — "
+                    f"nothing above quality threshold.\n"
+                    f"SPY ${spy_price:.2f} | VIX {vix:.1f} | {regime.value}\n"
+                    f"Sitting this one out. No trade > bad trade. 🪑",
+                    alert_type="info"
+                )
             self._update_scan_state(spy_price, now)
             return
 
