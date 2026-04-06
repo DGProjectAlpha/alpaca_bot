@@ -48,8 +48,14 @@ from options_strategies import (
 )
 from telegram_alerts import TelegramAlerts
 from trade_reviewer import (
-    save_proposals, review_trades, save_approvals, load_approvals,
+    save_proposals, save_approvals, load_approvals,
     format_proposals_for_telegram, format_review_for_telegram,
+    tiered_review, load_control,
+)
+from trade_journal import (
+    log_activity, record_trade, get_today_trade_count,
+    get_today_pnl, save_daily_summary, get_stats_summary,
+    load_trade_history,
 )
 
 # ─── Logging ───
@@ -106,6 +112,9 @@ class AlpacaBotOptions:
             alerts_topic_id=config.TELEGRAM_ALERTS_TOPIC_ID,
         )
 
+        # Load control settings
+        self.control = load_control()
+
         # Verify connection
         account = self.trading_client.get_account()
         mode_str = "📄 PAPER" if paper else "💰 LIVE"
@@ -117,7 +126,16 @@ class AlpacaBotOptions:
         log.info(f"Options Capital: ${config.OPTIONS_MAX_CAPITAL:,.2f}")
         log.info(f"Universe: {len(config.ETF_UNIVERSE)} ETFs, {len(config.STOCK_UNIVERSE)} stocks, {len(config.WHEEL_STOCKS)} wheel names")
         log.info(f"Scanning: event-driven (check every {config.CONDITION_CHECK_INTERVAL}s)")
+        log.info(f"Control: auto-approve >= {self.control.get('auto_approve_threshold', 0.75)}, "
+                 f"auto-reject < {self.control.get('auto_reject_threshold', 0.50)}")
         log.info(f"{'=' * 55}")
+
+        log_activity("bot_start", {
+            "mode": mode_str,
+            "dry_run": dry_run,
+            "equity": float(account.equity),
+            "control": self.control,
+        })
 
     # ═══════════════════════════════════════════════════════════
     # Market Data — Prices and Indicators
@@ -596,7 +614,27 @@ class AlpacaBotOptions:
         if self.dry_run:
             log.info(f"🏜️ DRY RUN — would close: {position['strategy']} {position['underlying']} — {reason}")
             position["status"] = "closed_dry"
+            position["close_time"] = datetime.now(ET).isoformat()
+            position["close_reason"] = reason
+            position["realized_pnl"] = pnl
             self._update_positions_file()
+            record_trade({
+                "strategy": position["strategy"],
+                "underlying": position["underlying"],
+                "contracts": position.get("contracts", 1),
+                "entry_time": position.get("entry_time", ""),
+                "close_time": position["close_time"],
+                "close_reason": reason,
+                "realized_pnl": pnl,
+                "dry_run": True,
+            })
+            log_activity("close", {
+                "strategy": position["strategy"],
+                "underlying": position["underlying"],
+                "pnl": pnl,
+                "reason": reason,
+                "dry_run": True,
+            })
             self.telegram.send_trade_alert(
                 f"🏜️ DRY RUN CLOSE\n"
                 f"{position['strategy']} {position['underlying']}\n"
@@ -631,6 +669,25 @@ class AlpacaBotOptions:
         position["realized_pnl"] = pnl
         self._update_positions_file()
 
+        # Record to trade journal
+        record_trade({
+            "strategy": position["strategy"],
+            "underlying": position["underlying"],
+            "contracts": position.get("contracts", 1),
+            "entry_time": position.get("entry_time", ""),
+            "close_time": position["close_time"],
+            "close_reason": reason,
+            "realized_pnl": pnl,
+            "max_profit": position.get("max_profit", 0),
+            "max_loss": position.get("max_loss", 0),
+        })
+        log_activity("close", {
+            "strategy": position["strategy"],
+            "underlying": position["underlying"],
+            "pnl": pnl,
+            "reason": reason,
+        })
+
         emoji = "💰" if pnl > 0 else "📉"
         self.telegram.send_trade_alert(
             f"{emoji} POSITION CLOSED\n"
@@ -648,7 +705,11 @@ class AlpacaBotOptions:
         Lightweight condition check — runs every 2 minutes.
         Only fetches SPY price and VIX. If a trigger fires, runs full scan.
         Otherwise just checks open positions for exits.
+        Respects control.json pause state.
         """
+        # Reload control settings every cycle (Claude can update anytime)
+        self.control = load_control()
+
         now = datetime.now(ET)
         market_open = now.replace(hour=9, minute=30, second=0)
         market_close = now.replace(hour=16, minute=0, second=0)
@@ -656,6 +717,15 @@ class AlpacaBotOptions:
         if now < market_open or now > market_close:
             return
         if now.weekday() >= 5:
+            return
+
+        # Respect pause — still monitor positions for exits, but don't scan for new trades
+        if self.control.get("paused", False):
+            open_count = sum(1 for p in self.active_positions if p.get("status") == "open")
+            if open_count > 0:
+                log.info(f"PAUSED — still monitoring {open_count} open positions for exits")
+                self._last_vix = self.get_vix()
+                self.check_positions()
             return
 
         spy_price = self.get_spy_price()
@@ -702,7 +772,7 @@ class AlpacaBotOptions:
     def run_full_scan(self, spy_price: float = None, vix: float = None, trigger: str = "manual"):
         """
         Full analysis cycle: scan all tickers, generate proposals,
-        send to Claude for review, execute approved trades.
+        run tiered review, execute approved trades.
         """
         now = datetime.now(ET)
         market_open = now.replace(hour=9, minute=30, second=0)
@@ -713,6 +783,11 @@ class AlpacaBotOptions:
             return
         if now.weekday() >= 5:
             log.info("Weekend. Market closed.")
+            return
+
+        # Respect pause
+        if self.control.get("paused", False):
+            log.info("PAUSED — skipping full scan")
             return
 
         log.info(f"{'─' * 55}")
@@ -773,17 +848,13 @@ class AlpacaBotOptions:
 
         if not setups:
             log.info("No viable setups found this scan — nothing above quality threshold.")
-            # Notify once per day that we're sitting out
-            today = now.strftime("%Y-%m-%d")
-            if not hasattr(self, '_no_trade_notified') or self._no_trade_notified != today:
-                self._no_trade_notified = today
-                self.alerts.send_alert(
-                    f"📊 Scanned {len(ticker_data)} tickers × 7 strategies — "
-                    f"nothing above quality threshold.\n"
-                    f"SPY ${spy_price:.2f} | VIX {vix:.1f} | {regime.value}\n"
-                    f"Sitting this one out. No trade > bad trade. 🪑",
-                    alert_type="info"
-                )
+            log_activity("scan", {
+                "tickers": len(ticker_data),
+                "setups_found": 0,
+                "spy": spy_price,
+                "vix": vix,
+                "trigger": trigger,
+            })
             self._update_scan_state(spy_price, now)
             return
 
@@ -832,18 +903,40 @@ class AlpacaBotOptions:
             "tickers_analyzed": len(ticker_data),
         }
 
-        # 13. Post proposals to Telegram
-        proposals_msg = format_proposals_for_telegram(proposals, market_context)
-        self.telegram.send_trade_alert(proposals_msg)
+        # 13. Log proposals
+        log_activity("proposal", {
+            "count": len(proposals),
+            "strategies": [p["strategy"] for p in proposals],
+            "tickers": [p["underlying"] for p in proposals],
+            "scores": [p["score"] for p in proposals],
+            "spy": spy_price,
+            "vix": vix,
+        })
 
-        # 14. Claude review pipeline
+        # 14. Check daily trade limits before review
+        daily_trades = get_today_trade_count()
+        max_daily = self.control.get("max_daily_trades", 8)
+        if daily_trades >= max_daily:
+            log.info(f"Daily trade limit reached ({daily_trades}/{max_daily}). Skipping review.")
+            log_activity("limit_reached", {"daily_trades": daily_trades, "max": max_daily})
+            self._update_scan_state(spy_price, now)
+            return
+
+        # 15. Tiered review: auto-approve/reject obvious, Claude CLI for borderline only
         pending = save_proposals(proposals, market_context)
-        review = review_trades(pending, account)
+        review = tiered_review(proposals, market_context, account)
         approvals = save_approvals(review, proposals)
-        review_msg = format_review_for_telegram(review, approvals)
-        self.telegram.send_trade_alert(review_msg)
 
-        # 15. Track rejections
+        # 16. Telegram notification — only if there's something actionable
+        verbosity = self.control.get("telegram_verbosity", "trades_only")
+        approved_count = approvals.get("total_approved", 0)
+        if verbosity == "all" or (verbosity == "trades_only" and approved_count > 0):
+            proposals_msg = format_proposals_for_telegram(proposals, market_context)
+            self.telegram.send_trade_alert(proposals_msg)
+            review_msg = format_review_for_telegram(review, approvals)
+            self.telegram.send_trade_alert(review_msg)
+
+        # 17. Track rejections
         for trade_decision in review.get("trades", []):
             if trade_decision.get("decision") == "reject":
                 tid = trade_decision.get("trade_id", 0)
@@ -853,10 +946,10 @@ class AlpacaBotOptions:
                     self.rejected_signatures.add(sig)
                     log.info(f"Marked as rejected: {sig}")
 
-        # 16. Execute approved trades
+        # 18. Execute approved trades
         approved_trades = approvals.get("approved_trades", [])
         if not approved_trades:
-            log.info("No trades approved by Claude. Standing by.")
+            log.info("No trades approved. Standing by.")
             self._update_scan_state(spy_price, now)
             return
 
@@ -866,7 +959,17 @@ class AlpacaBotOptions:
                         and setup.underlying == approved["underlying"]):
                     setup.contracts = approved.get("contracts", setup.contracts)
                     log.info(f"Executing approved trade: {setup.strategy.value} on {setup.underlying} ({setup.contracts} contracts)")
-                    self.execute_setup(setup)
+                    success = self.execute_setup(setup)
+                    log_activity("execute", {
+                        "strategy": setup.strategy.value,
+                        "underlying": setup.underlying,
+                        "contracts": setup.contracts,
+                        "max_profit": setup.max_profit,
+                        "max_loss": setup.max_loss,
+                        "score": setup.score,
+                        "success": success,
+                        "dry_run": self.dry_run,
+                    })
                     break
 
         self._update_scan_state(spy_price, now)
@@ -1035,6 +1138,15 @@ class AlpacaBotOptions:
         )
         self.telegram.send_briefing(msg)
 
+        log_activity("morning_briefing", {
+            "spy": spy_price,
+            "vix": vix,
+            "regime": regime.value,
+            "trend": trend.value,
+            "equity": account["equity"],
+            "open_positions": len(open_positions),
+        })
+
         # Run the full scan as part of morning briefing
         self.run_full_scan(spy_price, vix, trigger="morning_briefing")
 
@@ -1085,7 +1197,26 @@ class AlpacaBotOptions:
             for t in self.trades_today:
                 msg += f"  {t['action']} {t.get('symbol', '?')} @ ${t.get('premium', 0):.2f}\n"
 
+        # Lifetime stats
+        msg += f"\n{get_stats_summary()}\n"
+
         self.telegram.send_briefing(msg)
+
+        # Save daily summary to journal
+        save_daily_summary(now.strftime("%Y-%m-%d"), {
+            "date": now.strftime("%Y-%m-%d"),
+            "account": account,
+            "trades_executed": len(self.trades_today),
+            "positions_closed": len(closed_today),
+            "realized_pnl": total_realized,
+            "open_positions": len(open_positions),
+        })
+        log_activity("afternoon_briefing", {
+            "trades_today": len(self.trades_today),
+            "closed": len(closed_today),
+            "realized_pnl": total_realized,
+            "equity": account["equity"],
+        })
 
     def _generate_plan(
         self, spy_price: float, vix: float,
