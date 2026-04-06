@@ -230,16 +230,16 @@ def build_iron_condor(
     inc = _strike_increment(price)
     move = _expected_move(price, vix, dte)
 
-    # Short strikes at 1.3+ SD — must be OUTSIDE expected move
-    sd_mult = 1.5 if vix > 25 else 1.3
+    # Short strikes at 1.1-1.2 SD — outside expected move but close enough for premium
+    sd_mult = 1.3 if vix > 25 else 1.15
     put_offset = move * sd_mult
     call_offset = move * sd_mult
 
     # Skew strikes away from trend direction — if bullish, push calls wider
     if trend == TrendDirection.BULLISH:
-        call_offset = move * (sd_mult + 0.3)  # extra buffer on call side
+        call_offset = move * (sd_mult + 0.2)  # extra buffer on call side
     elif trend == TrendDirection.BEARISH:
-        put_offset = move * (sd_mult + 0.3)   # extra buffer on put side
+        put_offset = move * (sd_mult + 0.2)   # extra buffer on put side
 
     put_sell = round_to_strike(price - put_offset, inc)
     put_buy = round_to_strike(put_sell - spread_width, inc)

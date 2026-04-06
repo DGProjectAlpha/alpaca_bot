@@ -176,7 +176,7 @@ PROPOSED TRADES:
             ],
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=180,
             cwd="/workspace/AlpacaBot",
             env=clean_env,
         )
@@ -284,7 +284,10 @@ def _fallback_review(proposals: list) -> dict:
     trades = []
     for i, prop in enumerate(proposals):
         score = prop.get("score", 0)
-        if score >= 0.7:
+        rr = prop.get("risk_reward_ratio", 0)
+        pop = prop.get("probability_of_profit", 0)
+        # Fallback is strict: high score + decent R:R + good PoP
+        if score >= 0.7 and rr >= 0.15 and pop >= 0.60:
             trades.append({
                 "trade_id": i + 1,
                 "decision": "adjust",
