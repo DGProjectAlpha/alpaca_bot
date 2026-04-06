@@ -1,0 +1,199 @@
+{
+  "timestamp": "2026-04-06T11:48:08.636881-04:00",
+  "market": {
+    "spy_price": 657.47,
+    "vix": 23.6564,
+    "regime": "high_vol",
+    "trend": "bullish",
+    "ema_20": 655.5782868286453,
+    "ema_50": 652.3717115418891,
+    "recent_prices": [
+      654.41,
+      655.17,
+      655.01,
+      655.0,
+      654.5848,
+      654.75,
+      647.87,
+      647.75,
+      647.31,
+      644.59,
+      645.38,
+      649.63,
+      655.39,
+      654.0,
+      653.56,
+      653.2102,
+      654.46,
+      655.88,
+      655.91,
+      655.8,
+      655.9,
+      655.92,
+      658.14,
+      657.3,
+      656.74,
+      656.35,
+      656.58,
+      658.53,
+      657.49,
+      657.48
+    ],
+    "available_expirations": [
+      "2026-04-06",
+      "2026-04-07",
+      "2026-04-08"
+    ],
+    "wheel_candidates": [
+      {
+        "symbol": "SNAP",
+        "price": 4.615
+      },
+      {
+        "symbol": "NIO",
+        "price": 6.34
+      }
+    ]
+  },
+  "proposals": [
+    {
+      "strategy": "iron_condor",
+      "underlying": "SPY",
+      "contracts": 1,
+      "max_profit": 118.00000000000001,
+      "max_loss": 130.0,
+      "probability_of_profit": 0.68,
+      "risk_reward_ratio": 0.5384615384615384,
+      "target_dte": 0,
+      "score": 0.7335384615384615,
+      "reason": "Iron Condor on SPY | VIX=23.7 | Range: $657-$658 | 0DTE",
+      "legs": [
+        {
+          "symbol": "SPY260406P00655000",
+          "side": "buy",
+          "option_type": "put",
+          "strike": 655.0,
+          "expiration": "2026-04-06",
+          "premium": 0.515
+        },
+        {
+          "symbol": "SPY260406P00657000",
+          "side": "sell",
+          "option_type": "put",
+          "strike": 657.0,
+          "expiration": "2026-04-06",
+          "premium": 1.0750000000000002
+        },
+        {
+          "symbol": "SPY260406C00658000",
+          "side": "sell",
+          "option_type": "call",
+          "strike": 658.0,
+          "expiration": "2026-04-06",
+          "premium": 0.975
+        },
+        {
+          "symbol": "SPY260406C00660000",
+          "side": "buy",
+          "option_type": "call",
+          "strike": 660.0,
+          "expiration": "2026-04-06",
+          "premium": 0.355
+        }
+      ]
+    },
+    {
+      "strategy": "iron_condor",
+      "underlying": "SPY",
+      "contracts": 1,
+      "max_profit": 31.000000000000007,
+      "max_loss": 130.0,
+      "probability_of_profit": 0.68,
+      "risk_reward_ratio": 0.5384615384615384,
+      "target_dte": 1,
+      "score": 0.7335384615384615,
+      "reason": "Iron Condor on SPY | VIX=23.7 | Range: $648-$667 | 1DTE",
+      "legs": [
+        {
+          "symbol": "SPY260407P00646000",
+          "side": "buy",
+          "option_type": "put",
+          "strike": 646.0,
+          "expiration": "2026-04-07",
+          "premium": 0.615
+        },
+        {
+          "symbol": "SPY260407P00648000",
+          "side": "sell",
+          "option_type": "put",
+          "strike": 648.0,
+          "expiration": "2026-04-07",
+          "premium": 0.785
+        },
+        {
+          "symbol": "SPY260407C00667000",
+          "side": "sell",
+          "option_type": "call",
+          "strike": 667.0,
+          "expiration": "2026-04-07",
+          "premium": 0.335
+        },
+        {
+          "symbol": "SPY260407C00669000",
+          "side": "buy",
+          "option_type": "call",
+          "strike": 669.0,
+          "expiration": "2026-04-07",
+          "premium": 0.195
+        }
+      ]
+    },
+    {
+      "strategy": "iron_condor",
+      "underlying": "SPY",
+      "contracts": 1,
+      "max_profit": 39.49999999999998,
+      "max_loss": 130.0,
+      "probability_of_profit": 0.68,
+      "risk_reward_ratio": 0.5384615384615384,
+      "target_dte": 2,
+      "score": 0.7335384615384615,
+      "reason": "Iron Condor on SPY | VIX=23.7 | Range: $644-$671 | 2DTE",
+      "legs": [
+        {
+          "symbol": "SPY260408P00642000",
+          "side": "buy",
+          "option_type": "put",
+          "strike": 642.0,
+          "expiration": "2026-04-08",
+          "premium": 1.09
+        },
+        {
+          "symbol": "SPY260408P00644000",
+          "side": "sell",
+          "option_type": "put",
+          "strike": 644.0,
+          "expiration": "2026-04-08",
+          "premium": 1.315
+        },
+        {
+          "symbol": "SPY260408C00671000",
+          "side": "sell",
+          "option_type": "call",
+          "strike": 671.0,
+          "expiration": "2026-04-08",
+          "premium": 0.405
+        },
+        {
+          "symbol": "SPY260408C00673000",
+          "side": "buy",
+          "option_type": "call",
+          "strike": 673.0,
+          "expiration": "2026-04-08",
+          "premium": 0.235
+        }
+      ]
+    }
+  ],
+  "status": "pending_review"
+}

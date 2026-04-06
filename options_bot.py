@@ -82,6 +82,7 @@ class AlpacaBotOptions:
         self.trades_today = []
         self.pending_setups = []  # setups waiting for execution
         self.active_positions = self._load_positions()
+        self.rejected_signatures = set()  # track rejected trade signatures to avoid re-proposing
 
         # Telegram alerts
         self.telegram = TelegramAlerts(
@@ -618,7 +619,22 @@ class AlpacaBotOptions:
 
         if not setups:
             log.info("No viable setups found this cycle.")
-            self.telegram.send_trade_alert("📊 Scan complete — no viable setups this cycle. Standing by.")
+            return
+
+        # Filter out previously rejected trade signatures
+        filtered = []
+        for setup in setups:
+            sig = f"{setup.strategy.value}_{setup.underlying}_{setup.target_dte}"
+            for leg in setup.legs:
+                sig += f"_{leg.strike}"
+            if sig not in self.rejected_signatures:
+                filtered.append(setup)
+            else:
+                log.info(f"Skipping previously rejected: {sig}")
+        setups = filtered
+
+        if not setups:
+            log.info("All setups were previously rejected. Waiting for new conditions.")
             return
 
         # 5. Resolve option symbols and get real quotes for top setups
@@ -633,6 +649,26 @@ class AlpacaBotOptions:
                 )
                 if real_premium > 0:
                     setup.max_profit = real_premium * 100
+                    # Recalculate max_loss and risk/reward with real numbers
+                    # For spreads: max_loss = (spread_width * 100) - net_premium
+                    if len(setup.legs) >= 4:  # iron condor
+                        sell_strikes = [l.strike for l in setup.legs if l.side == "sell"]
+                        buy_strikes = [l.strike for l in setup.legs if l.side == "buy"]
+                        if sell_strikes and buy_strikes:
+                            spread_width = max(abs(s - b) for s in sell_strikes for b in buy_strikes if abs(s - b) < 20)
+                            setup.max_loss = (spread_width * 100) - setup.max_profit
+                    elif len(setup.legs) == 2:  # credit spread
+                        strikes = [l.strike for l in setup.legs]
+                        spread_width = abs(strikes[0] - strikes[1])
+                        setup.max_loss = (spread_width * 100) - setup.max_profit
+                    # Update risk/reward ratio with real values
+                    setup.risk_reward_ratio = setup.max_profit / setup.max_loss if setup.max_loss > 0 else 0
+                    # Recalculate score with real R:R
+                    setup.score = (
+                        setup.probability_of_profit * 0.4 +
+                        min(setup.risk_reward_ratio, 1.0) * 0.3 +
+                        0.3  # vol bonus (we're already in the right regime)
+                    )
             resolved_setups.append(setup)
 
         # 6. Convert setups to proposal dicts for review
@@ -676,7 +712,19 @@ class AlpacaBotOptions:
         review_msg = format_review_for_telegram(review, approvals)
         self.telegram.send_trade_alert(review_msg)
 
-        # 10. Execute only approved trades
+        # 10. Track rejected trades so we don't re-propose them
+        for trade_decision in review.get("trades", []):
+            if trade_decision.get("decision") == "reject":
+                tid = trade_decision.get("trade_id", 0)
+                if 0 < tid <= len(resolved_setups):
+                    setup = resolved_setups[tid - 1]
+                    sig = f"{setup.strategy.value}_{setup.underlying}_{setup.target_dte}"
+                    for leg in setup.legs:
+                        sig += f"_{leg.strike}"
+                    self.rejected_signatures.add(sig)
+                    log.info(f"Marked as rejected: {sig}")
+
+        # 11. Execute only approved trades
         approved_trades = approvals.get("approved_trades", [])
         if not approved_trades:
             log.info("No trades approved by Claude. Standing by.")
@@ -718,6 +766,11 @@ class AlpacaBotOptions:
         now = datetime.now(ET)
         if now.weekday() >= 5:
             return
+
+        # New day, clear rejection memory — market conditions have changed
+        self.rejected_signatures.clear()
+        self.trades_today = []
+        log.info("Morning reset: cleared rejection memory and trade log")
 
         spy_price = self.get_spy_price()
         vix = self.get_vix()
@@ -896,6 +949,21 @@ def main():
     if not config.API_KEY or not config.SECRET_KEY:
         log.error("Missing API keys! Set ALPACA_API_KEY and ALPACA_SECRET_KEY in .env")
         sys.exit(1)
+
+    # Prevent multiple instances
+    import os
+    pid_file = Path("/workspace/AlpacaBot/bot.pid")
+    if pid_file.exists():
+        old_pid = pid_file.read_text().strip()
+        # Check if process is still running
+        try:
+            old_pid_num = int(old_pid.replace("PID: ", ""))
+            os.kill(old_pid_num, 0)  # signal 0 = check if alive
+            log.error(f"Another instance already running (PID {old_pid_num}). Exiting.")
+            sys.exit(1)
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass  # old process is dead, we can proceed
+    pid_file.write_text(str(os.getpid()))
 
     # Start in DRY RUN mode — analyze but don't trade
     bot = AlpacaBotOptions(dry_run=config.DRY_RUN)

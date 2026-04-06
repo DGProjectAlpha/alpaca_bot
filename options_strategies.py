@@ -130,8 +130,10 @@ def select_iron_condor_strikes(
     Returns dict with put_buy, put_sell, call_sell, call_buy strikes.
     """
     # Annualized vol → daily vol → move over DTE period
+    # For 0DTE, use 0.5 days (half a trading day remaining on average)
     daily_vol = (vix / 100) / math.sqrt(252)
-    expected_move = current_price * daily_vol * math.sqrt(dte)
+    time_factor = max(dte, 0.5)  # never zero — 0DTE still has intraday move
+    expected_move = current_price * daily_vol * math.sqrt(time_factor)
 
     # Short strikes at ~1 standard deviation (adjustable)
     # Higher VIX = we can go wider and still collect decent premium
@@ -180,7 +182,8 @@ def select_credit_spread_strikes(
     Bearish → Bear Call Spread (sell call, buy higher call)
     """
     daily_vol = (vix / 100) / math.sqrt(252)
-    expected_move = current_price * daily_vol * math.sqrt(dte)
+    time_factor = max(dte, 0.5)
+    expected_move = current_price * daily_vol * math.sqrt(time_factor)
 
     # Place short strike at ~0.7-1.0 SD away from current price
     offset = expected_move * 0.85
@@ -222,7 +225,8 @@ def select_wheel_strike(
     Sell put slightly OTM — want to get assigned at a discount.
     """
     daily_vol = (vix / 100) / math.sqrt(252)
-    expected_move = current_price * daily_vol * math.sqrt(dte)
+    time_factor = max(dte, 0.5)
+    expected_move = current_price * daily_vol * math.sqrt(time_factor)
 
     # Put strike ~0.5 SD below current price (higher probability of profit)
     target = current_price - (expected_move * 0.5)
@@ -458,13 +462,13 @@ def select_strategy(
 
     # ── High Volatility: Iron Condors are king ──
     if regime == MarketRegime.HIGH_VOL:
-        # 0-3 DTE iron condors on SPY
+        # 0-3 DTE iron condors on SPY — use $5 wide wings for better premium
         for exp in expirations:
             dte = _days_to_expiration(exp)
             if 0 <= dte <= 3:
                 ic = build_iron_condor(
                     "SPY", spy_price, vix, dte, exp,
-                    max_capital, spread_width=2.0, strike_increment=1.0,
+                    max_capital, spread_width=5.0, strike_increment=1.0,
                 )
                 if ic:
                     setups.append(ic)
@@ -476,7 +480,7 @@ def select_strategy(
                 if 5 <= dte <= 14:
                     cs = build_credit_spread(
                         "SPY", spy_price, vix, dte, exp, trend,
-                        max_capital, spread_width=2.0, strike_increment=1.0,
+                        max_capital, spread_width=5.0, strike_increment=1.0,
                     )
                     if cs:
                         cs.score *= 0.8  # slightly penalize vs IC in high vol
@@ -491,7 +495,7 @@ def select_strategy(
                 if trend != TrendDirection.NEUTRAL:
                     cs = build_credit_spread(
                         "SPY", spy_price, vix, dte, exp, trend,
-                        max_capital, spread_width=2.0, strike_increment=1.0,
+                        max_capital, spread_width=5.0, strike_increment=1.0,
                     )
                     if cs:
                         setups.append(cs)
@@ -499,7 +503,7 @@ def select_strategy(
                     # No clear trend — small iron condor
                     ic = build_iron_condor(
                         "SPY", spy_price, vix, dte, exp,
-                        max_capital, spread_width=1.0, strike_increment=1.0,
+                        max_capital, spread_width=3.0, strike_increment=1.0,
                     )
                     if ic:
                         ic.score *= 0.7  # not ideal conditions for IC
