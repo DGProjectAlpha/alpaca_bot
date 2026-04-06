@@ -905,6 +905,15 @@ class AlpacaBotOptions:
             setup.max_loss = abs(real_premium) * 100
             setup.risk_reward_ratio = setup.max_profit / setup.max_loss if setup.max_loss > 0 else 0
 
+        # Re-cap position size after real quotes — enforce hard 5% equity limit
+        if setup.max_loss > 0:
+            account = self.get_account_info()
+            max_risk = account["equity"] * setup.risk_budget
+            max_contracts = max(1, int(max_risk / setup.max_loss))
+            if setup.contracts > max_contracts:
+                log.info(f"Resized {setup.underlying} {setup.strategy.value}: {setup.contracts} → {max_contracts} contracts (risk cap)")
+                setup.contracts = max_contracts
+
     def _build_proposals(self, setups: list) -> list:
         """Convert resolved setups to proposal dicts for the review pipeline."""
         proposals = []

@@ -219,6 +219,7 @@ def build_iron_condor(
     expiration: str,
     equity: float,
     spread_width: float = None,
+    trend: TrendDirection = TrendDirection.NEUTRAL,
 ) -> Optional[OptionsTradeSetup]:
     """
     Iron Condor: sell OTM put spread + OTM call spread.
@@ -229,13 +230,20 @@ def build_iron_condor(
     inc = _strike_increment(price)
     move = _expected_move(price, vix, dte)
 
-    # Short strikes at ~1 SD, wider in higher vol
-    sd_mult = 1.2 if vix > 25 else 1.0
-    offset = move * sd_mult
+    # Short strikes at 1.3+ SD — must be OUTSIDE expected move
+    sd_mult = 1.5 if vix > 25 else 1.3
+    put_offset = move * sd_mult
+    call_offset = move * sd_mult
 
-    put_sell = round_to_strike(price - offset, inc)
+    # Skew strikes away from trend direction — if bullish, push calls wider
+    if trend == TrendDirection.BULLISH:
+        call_offset = move * (sd_mult + 0.3)  # extra buffer on call side
+    elif trend == TrendDirection.BEARISH:
+        put_offset = move * (sd_mult + 0.3)   # extra buffer on put side
+
+    put_sell = round_to_strike(price - put_offset, inc)
     put_buy = round_to_strike(put_sell - spread_width, inc)
-    call_sell = round_to_strike(price + offset, inc)
+    call_sell = round_to_strike(price + call_offset, inc)
     call_buy = round_to_strike(call_sell + spread_width, inc)
 
     # Sanity: short strikes must be OTM
@@ -750,7 +758,7 @@ def select_strategy(
                 # Skip 0DTE after 11 AM ET
                 if dte == 0 and current_hour >= 11:
                     continue
-                ic = build_iron_condor(sym, td.price, vix, dte, exp, equity)
+                ic = build_iron_condor(sym, td.price, vix, dte, exp, equity, trend=td.trend)
                 if ic:
                     setups.append(ic)
 
