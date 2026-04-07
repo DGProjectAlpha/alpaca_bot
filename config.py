@@ -51,10 +51,33 @@ VWAP_DEVIATION_BUY = -0.02
 VWAP_DEVIATION_SELL = 0.01
 
 WATCHLIST = [
-    "AAPL", "MSFT", "GOOGL", "AMZN", "META",
-    "NVDA", "AMD", "TSLA", "SPY", "QQQ",
-    "NFLX", "DIS", "PYPL", "SQ", "COIN",
-    "SOFI", "PLTR", "SNAP", "UBER", "RIVN",
+    # ── Big Tech ──
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "AMD", "TSLA",
+    # ── Major ETFs ──
+    "SPY", "QQQ", "IWM", "DIA", "XLF", "XLE", "XLV", "XLI", "XLK", "XLP",
+    "GDX", "TLT", "HYG", "EEM", "ARKK",
+    # ── Financials ──
+    "JPM", "GS", "BAC", "MS", "V", "MA", "AXP", "C",
+    # ── Healthcare / Pharma ──
+    "UNH", "JNJ", "PFE", "ABBV", "MRK", "LLY", "BMY",
+    # ── Energy ──
+    "XOM", "CVX", "OXY", "COP", "SLB",
+    # ── Industrials / Defense ──
+    "BA", "CAT", "DE", "LMT", "RTX", "GE", "HON",
+    # ── Consumer / Retail ──
+    "WMT", "COST", "TGT", "HD", "LOW", "NKE", "SBUX", "MCD",
+    # ── Telecom / Media ──
+    "NFLX", "DIS", "CMCSA", "T", "VZ",
+    # ── Payments / Fintech ──
+    "PYPL", "SQ", "SOFI",
+    # ── Tech Mid-Cap ──
+    "CRM", "ORCL", "ADBE", "INTC", "QCOM", "AVGO", "MU",
+    # ── Transport / Logistics ──
+    "UBER", "FDX", "UPS", "DAL", "UAL",
+    # ── Auto / EV ──
+    "RIVN", "F", "GM",
+    # ── Utilities / REITs (defensive) ──
+    "NEE", "DUK", "SO",
 ]
 
 MARKET_OPEN = "09:30"
@@ -70,8 +93,12 @@ OPTIONS_MAX_DAILY_LOSS = float(os.getenv("OPTIONS_MAX_DAILY_LOSS", "200"))  # $2
 # ═══════════════════════════════════════════════════════════════
 # Multi-Ticker Universe
 # ═══════════════════════════════════════════════════════════════
-ETF_UNIVERSE = ["SPY", "QQQ", "IWM", "DIA"]
-STOCK_UNIVERSE = ["TSLA", "NVDA", "AMD", "META", "AMZN", "AAPL", "GOOGL", "MSFT"]
+ETF_UNIVERSE = ["SPY", "QQQ", "IWM", "DIA", "XLF", "XLE", "XLV", "XLK", "GDX", "TLT", "HYG", "EEM"]
+STOCK_UNIVERSE = [
+    "TSLA", "NVDA", "AMD", "META", "AMZN", "AAPL", "GOOGL", "MSFT",
+    "JPM", "GS", "BAC", "UNH", "LLY", "XOM", "CVX", "BA", "CAT",
+    "CRM", "ORCL", "NFLX", "COST", "HD",
+]
 WHEEL_STOCKS = [
     # Only stocks where 1 CSP contract collateral fits in our budget
     # With $2,000 account, max ~$500-800 collateral per wheel position
@@ -88,6 +115,7 @@ ALL_TICKERS = sorted(set(ETF_UNIVERSE + STOCK_UNIVERSE + WHEEL_STOCKS))
 # ═══════════════════════════════════════════════════════════════
 # Smart Scanning — Event-Driven
 # ═══════════════════════════════════════════════════════════════
+SCAN_INTERVAL_MINUTES = 5        # minutes between full scan cycles
 CONDITION_CHECK_INTERVAL = 120   # seconds between lightweight condition checks
 SPY_MOVE_THRESHOLD = 0.005       # 0.5% move triggers full rescan
 VIX_CHANGE_THRESHOLD = 1.0       # 1-point VIX change triggers full rescan
