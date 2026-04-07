@@ -24,9 +24,13 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.enums import DataFeed
 from alpaca.data.timeframe import TimeFrame
 
+import subprocess
+import os
+
 import config
 from strategies import generate_signal
 from telegram_alerts import TelegramAlerts
+from trade_journal import log_activity
 
 # ─── Logging ───
 logging.basicConfig(
@@ -238,14 +242,18 @@ class AlpacaBot:
                               f"Take profit at {pos['pnl_pct']:.1f}%")
 
     def scan_for_entries(self):
-        """Scan watchlist for buy signals."""
+        """Scan watchlist for buy signals, run through Claude review, execute approved trades."""
+        scan_results = []
+
         if not self.can_buy():
             log.info("Max positions reached or insufficient buying power. Skipping scan.")
-            return
+            return scan_results
 
         # Don't buy stocks we already hold
         held = {p["symbol"] for p in self.get_positions()}
 
+        # Phase 1: Collect all proposals (don't execute yet)
+        proposals = []
         for symbol in config.WATCHLIST:
             if symbol in held:
                 continue
@@ -262,18 +270,240 @@ class AlpacaBot:
                     qty = self.calculate_position_size(price)
 
                     if qty > 0:
-                        reason = f"Confidence {signal['confidence']:.0%}: {', '.join(signal['reasons'])}"
-                        self.place_buy(symbol, qty, reason)
-
-                        if not self.can_buy():
-                            log.info("Position limit reached after buy. Stopping scan.")
-                            return
+                        proposals.append({
+                            "symbol": symbol,
+                            "qty": qty,
+                            "price": price,
+                            "confidence": signal["confidence"],
+                            "reasons": signal["reasons"],
+                            "rsi": signal.get("rsi", 0),
+                            "action": "BUY",
+                        })
 
                 elif signal["action"] != "HOLD":
-                    log.debug(f"{symbol}: {signal['action']} (conf: {signal['confidence']:.0%}) — {', '.join(signal['reasons'])}")
+                    scan_results.append(f"👀 {symbol}: {signal['action']} ({signal['confidence']:.0%}) — {', '.join(signal['reasons'])}")
 
             except Exception as e:
                 log.error(f"Error scanning {symbol}: {e}")
+
+        if not proposals:
+            return scan_results
+
+        # Phase 2: Send proposals to Claude for review
+        log.info(f"📋 {len(proposals)} buy signals detected — sending to Claude for review...")
+        account = self.get_account_info()
+        review = self._claude_equity_review(proposals, account)
+
+        # Phase 3: Send review to Telegram
+        review_msg = self._format_equity_review(proposals, review)
+        self.tg.send_trade_alert(review_msg)
+
+        # Phase 4: Execute only approved trades
+        for decision in review.get("trades", []):
+            trade_id = decision.get("trade_id", 0)
+            if decision.get("decision") not in ("approve", "adjust"):
+                scan_results.append(f"❌ Trade #{trade_id}: REJECTED — {decision.get('reason', '')}")
+                continue
+
+            if trade_id < 1 or trade_id > len(proposals):
+                continue
+
+            prop = proposals[trade_id - 1]
+            qty = decision.get("adjusted_qty", prop["qty"])
+            reason = f"Confidence {prop['confidence']:.0%}: {', '.join(prop['reasons'])} | Claude: {decision.get('reason', 'approved')}"
+
+            self.place_buy(prop["symbol"], qty, reason)
+            scan_results.append(f"🟢 {prop['symbol']}: BUY {qty} @ ${prop['price']:.2f} — {reason}")
+
+            if not self.can_buy():
+                log.info("Position limit reached after buy. Stopping execution.")
+                break
+
+        return scan_results
+
+    def _claude_equity_review(self, proposals: list, account: dict) -> dict:
+        """Send equity trade proposals to Claude CLI for review."""
+        prompt = f"""Review these equity trade proposals from an automated mean-reversion/momentum bot.
+
+ACCOUNT:
+- Equity: ${account['equity']:,.2f}
+- Cash: ${account['cash']:,.2f}
+- P&L Today: ${account['pnl_today']:+,.2f}
+- Mode: {'Paper' if self.paper else 'LIVE'}
+- Date: {datetime.now(ET).strftime('%A %B %d, %Y %H:%M ET')}
+
+PROPOSED TRADES:
+"""
+        for i, prop in enumerate(proposals, 1):
+            prompt += f"""
+--- Trade #{i} ---
+Action: BUY {prop['qty']} shares of {prop['symbol']}
+Price: ${prop['price']:.2f} (total: ${prop['price'] * prop['qty']:,.2f})
+Confidence: {prop['confidence']:.0%}
+RSI: {prop.get('rsi', 'N/A')}
+Signals: {', '.join(prop['reasons'])}
+"""
+        prompt += """
+Be decisive. Approve good setups, reject marginal ones. We want small consistent gains, not home runs.
+For each trade: approve, reject, or adjust (change quantity). Explain your reasoning briefly."""
+
+        review_schema = json.dumps({
+            "type": "object",
+            "properties": {
+                "market_assessment": {"type": "string", "description": "1-2 sentence market view"},
+                "trades": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "trade_id": {"type": "integer"},
+                            "decision": {"type": "string", "enum": ["approve", "reject", "adjust"]},
+                            "adjusted_qty": {"type": "integer", "description": "Share quantity (same if approve, different if adjust)"},
+                            "reason": {"type": "string"},
+                            "risk_notes": {"type": "string"}
+                        },
+                        "required": ["trade_id", "decision", "adjusted_qty", "reason"]
+                    }
+                },
+                "summary": {"type": "string", "description": "2-3 sentence summary for Telegram"}
+            },
+            "required": ["market_assessment", "trades", "summary"]
+        })
+
+        system_prompt = """You are a senior equity risk manager reviewing proposed stock trades for a conservative automated bot.
+
+Rules:
+- This bot targets small, consistent profits. NO speculative plays.
+- Approve trades with strong technical confluence (RSI oversold + Bollinger + EMA alignment)
+- Reject trades where signals are marginal or the stock is in a clear downtrend (catching a falling knife)
+- Consider: is this a mean reversion bounce or a value trap?
+- RSI below 30 is genuinely oversold. RSI 35-45 is only mildly oversold — need more confluence.
+- If the stock has been declining for weeks, a low RSI alone isn't enough
+- Max 5% of equity per position
+- Fewer high-conviction trades > many marginal ones
+- "No trade" is always valid. Protect capital first.
+
+Be direct. No hedging language. You are protecting real money."""
+
+        try:
+            clean_env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+
+            result = subprocess.run(
+                [
+                    "claude", "-p",
+                    "--model", "sonnet",
+                    "--output-format", "json",
+                    "--json-schema", review_schema,
+                    "--append-system-prompt", system_prompt,
+                    "--no-session-persistence",
+                    "--dangerously-skip-permissions",
+                    prompt,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=180,
+                cwd="/workspace/AlpacaBot",
+                env=clean_env,
+            )
+
+            if result.returncode != 0:
+                log.error(f"Claude equity review failed (exit {result.returncode}): {result.stderr[:500]}")
+                return self._fallback_equity_review(proposals)
+
+            output = result.stdout.strip()
+            try:
+                wrapper = json.loads(output)
+                if isinstance(wrapper, dict) and "structured_output" in wrapper:
+                    review = wrapper["structured_output"]
+                elif isinstance(wrapper, dict) and "result" in wrapper:
+                    try:
+                        review = json.loads(wrapper["result"])
+                    except (json.JSONDecodeError, TypeError):
+                        review = wrapper
+                elif isinstance(wrapper, dict) and "market_assessment" in wrapper:
+                    review = wrapper
+                else:
+                    review = wrapper
+            except (json.JSONDecodeError, TypeError):
+                log.error(f"Failed to parse Claude equity review: {output[:500]}")
+                return self._fallback_equity_review(proposals)
+
+            if "trades" not in review:
+                log.error("Equity review missing 'trades' field")
+                return self._fallback_equity_review(proposals)
+
+            log.info(f"Claude equity review complete: {review.get('summary', '')}")
+            log_activity("equity_claude_review", {
+                "proposals": len(proposals),
+                "decisions": [{"id": t["trade_id"], "decision": t["decision"]} for t in review.get("trades", [])],
+            })
+            return review
+
+        except subprocess.TimeoutExpired:
+            log.error("Claude equity review timed out (180s)")
+            return self._fallback_equity_review(proposals)
+        except Exception as e:
+            log.error(f"Claude equity review failed: {e}")
+            return self._fallback_equity_review(proposals)
+
+    def _fallback_equity_review(self, proposals: list) -> dict:
+        """Conservative fallback when Claude is unavailable — only approve high-confidence trades."""
+        log.warning("Using fallback equity review (Claude unavailable)")
+        trades = []
+        for i, prop in enumerate(proposals, 1):
+            if prop["confidence"] >= 0.65:
+                trades.append({
+                    "trade_id": i,
+                    "decision": "approve",
+                    "adjusted_qty": prop["qty"],
+                    "reason": f"Fallback auto-approved: {prop['confidence']:.0%} confidence >= 65% threshold",
+                    "risk_notes": "Claude unavailable — only high-confidence trades approved",
+                })
+            else:
+                trades.append({
+                    "trade_id": i,
+                    "decision": "reject",
+                    "adjusted_qty": 0,
+                    "reason": f"Fallback rejected: {prop['confidence']:.0%} confidence < 65% threshold (Claude unavailable)",
+                })
+        return {
+            "market_assessment": "Claude review unavailable — conservative fallback mode",
+            "trades": trades,
+            "summary": "Fallback: only trades with ≥65% confidence approved. Claude was unavailable.",
+        }
+
+    def _format_equity_review(self, proposals: list, review: dict) -> str:
+        """Format the Claude equity review as a Telegram message."""
+        lines = [
+            f"🧠 EQUITY TRADE REVIEW — {datetime.now(ET).strftime('%H:%M ET')}",
+            "",
+            f"📊 {review.get('market_assessment', 'N/A')}",
+            "",
+        ]
+
+        for decision in review.get("trades", []):
+            tid = decision.get("trade_id", 0)
+            dec = decision.get("decision", "?")
+            dec_emoji = {"approve": "✅", "reject": "❌", "adjust": "🔧"}.get(dec, "❓")
+
+            if 0 < tid <= len(proposals):
+                prop = proposals[tid - 1]
+                qty = decision.get("adjusted_qty", prop["qty"])
+                lines.append(f"{dec_emoji} #{tid} {prop['symbol']}: {dec.upper()} {qty} shares @ ${prop['price']:.2f}")
+                lines.append(f"   Signal: {prop['confidence']:.0%} — {', '.join(prop['reasons'])}")
+            else:
+                lines.append(f"{dec_emoji} #{tid}: {dec.upper()}")
+
+            lines.append(f"   {decision.get('reason', '')}")
+            if decision.get("risk_notes"):
+                lines.append(f"   ⚠️ {decision['risk_notes']}")
+            lines.append("")
+
+        approved = sum(1 for t in review.get("trades", []) if t.get("decision") in ("approve", "adjust"))
+        lines.append(f"📋 Result: {approved}/{len(proposals)} trades approved")
+        lines.append(f"💬 {review.get('summary', '')}")
+
+        return "\n".join(lines)
 
     def scan_for_exits(self):
         """Check held positions for sell signals (beyond stop/TP)."""
@@ -317,7 +547,7 @@ class AlpacaBot:
         self.scan_for_exits()
 
         # 3. Scan for new entry opportunities
-        self.scan_for_entries()
+        scan_results = self.scan_for_entries()
 
         # 4. Log status
         account = self.get_account_info()
@@ -329,6 +559,24 @@ class AlpacaBot:
         for pos in positions:
             log.info(f"  {pos['symbol']}: {pos['qty']} shares @ ${pos['avg_entry']:.2f} "
                     f"→ ${pos['current_price']:.2f} ({pos['pnl_pct']:+.1f}%)")
+
+        # 5. Send scan summary to Telegram
+        now = datetime.now(ET)
+        pos_lines = []
+        for pos in positions:
+            emoji = "🟢" if pos["pnl_pct"] > 0 else "🔴"
+            pos_lines.append(f"  {emoji} {pos['symbol']}: {pos['qty']:.0f} @ ${pos['current_price']:.2f} ({pos['pnl_pct']:+.1f}%)")
+
+        summary = f"📡 Scan {now.strftime('%H:%M ET')}\n"
+        summary += f"💰 ${account['equity']:,.2f} | P&L: ${account['pnl_today']:+,.2f}\n"
+        if pos_lines:
+            summary += "\n".join(pos_lines) + "\n"
+        if scan_results:
+            summary += "\nSignals:\n" + "\n".join(scan_results)
+        else:
+            summary += "\nNo signals triggered."
+
+        self.tg.send_trade_alert(summary)
 
     def status(self) -> str:
         """Return a human-readable status string."""
