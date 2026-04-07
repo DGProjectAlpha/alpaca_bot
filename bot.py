@@ -93,16 +93,28 @@ class AlpacaBot:
         self._protect_existing_positions()
 
     def _protect_existing_positions(self):
-        """On startup, place OTO (stop + take profit) orders for any positions missing bracket protection."""
+        """On startup, place stop + take profit orders for any positions missing bracket protection."""
         positions = self.get_positions()
         if not positions:
             return
 
+        # Check which symbols already have open orders (bracket legs or manual SL/TP)
         bracketed = self._get_symbols_with_bracket_legs()
+
+        # Also check raw open orders — if shares are "held_for_orders", they're already protected
+        try:
+            open_orders = self.trading_client.get_orders(
+                filter=GetOrdersRequest(status=QueryOrderStatus.OPEN)
+            )
+            for o in open_orders:
+                bracketed.add(o.symbol)
+        except Exception:
+            pass
+
         unprotected = [p for p in positions if p["symbol"] not in bracketed]
 
         if not unprotected:
-            log.info("✅ All existing positions have bracket orders active.")
+            log.info("✅ All existing positions have protective orders active.")
             return
 
         for pos in unprotected:
