@@ -15,10 +15,11 @@ from zoneinfo import ZoneInfo
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
-    MarketOrderRequest, LimitOrderRequest,
-    GetOrdersRequest, QueryOrderStatus
+    MarketOrderRequest, LimitOrderRequest, StopOrderRequest,
+    GetOrdersRequest, QueryOrderStatus,
+    TakeProfitRequest, StopLossRequest,
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus, OrderClass
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.enums import DataFeed
@@ -85,7 +86,58 @@ class AlpacaBot:
         log.info(f"Max capital: ${config.MAX_CAPITAL:,.2f}")
         log.info(f"Max position size: {config.MAX_POSITION_PCT*100:.0f}%")
         log.info(f"Stop loss: {config.STOP_LOSS_PCT*100:.0f}% / Take profit: {config.TAKE_PROFIT_PCT*100:.0f}%")
+        log.info(f"Bracket orders: ENABLED (exchange-level SL/TP)")
         log.info(f"{'='*50}")
+
+        # Protect any existing positions that don't have bracket orders
+        self._protect_existing_positions()
+
+    def _protect_existing_positions(self):
+        """On startup, place OTO (stop + take profit) orders for any positions missing bracket protection."""
+        positions = self.get_positions()
+        if not positions:
+            return
+
+        bracketed = self._get_symbols_with_bracket_legs()
+        unprotected = [p for p in positions if p["symbol"] not in bracketed]
+
+        if not unprotected:
+            log.info("✅ All existing positions have bracket orders active.")
+            return
+
+        for pos in unprotected:
+            entry = pos["avg_entry"]
+            stop_price = round(entry * (1 - config.STOP_LOSS_PCT), 2)
+            profit_price = round(entry * (1 + config.TAKE_PROFIT_PCT), 2)
+            qty = int(pos["qty"])
+
+            try:
+                # Two separate orders for existing positions: stop loss + take profit
+                stop_order = StopOrderRequest(
+                    symbol=pos["symbol"],
+                    qty=qty,
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.GTC,
+                    stop_price=stop_price,
+                )
+                self.trading_client.submit_order(stop_order)
+
+                tp_order = LimitOrderRequest(
+                    symbol=pos["symbol"],
+                    qty=qty,
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.GTC,
+                    limit_price=profit_price,
+                )
+                self.trading_client.submit_order(tp_order)
+
+                log.info(f"🛡️ Protected {pos['symbol']}: SL ${stop_price} / TP ${profit_price}")
+                self.tg.send_trade_alert(
+                    f"🛡️ Bracket added for {pos['symbol']} ({qty} shares)\n"
+                    f"Entry: ${entry:.2f} | SL: ${stop_price} | TP: ${profit_price}"
+                )
+            except Exception as e:
+                log.error(f"❌ Failed to protect {pos['symbol']}: {e}")
 
     def get_account_info(self) -> dict:
         """Get current account state."""
@@ -156,23 +208,54 @@ class AlpacaBot:
         shares = int(max_spend / price)
         return max(shares, 0)
 
-    def place_buy(self, symbol: str, qty: int, reason: str) -> bool:
-        """Place a market buy order with bracket (stop loss + take profit)."""
+    def place_buy(self, symbol: str, qty: int, reason: str, entry_price: float = None) -> bool:
+        """Place a bracket buy order — exchange-level stop loss + take profit (OCO)."""
         if qty <= 0:
             return False
 
         try:
-            order = MarketOrderRequest(
-                symbol=symbol,
-                qty=qty,
-                side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY,
-            )
+            # Calculate stop/profit prices from entry (or latest known price)
+            if entry_price and entry_price > 0:
+                stop_price = round(entry_price * (1 - config.STOP_LOSS_PCT), 2)
+                profit_price = round(entry_price * (1 + config.TAKE_PROFIT_PCT), 2)
+            else:
+                # Fallback: get current price for bracket calc
+                bars = self.get_bars(symbol, days=2)
+                if not bars.empty:
+                    entry_price = bars["close"].iloc[-1]
+                    stop_price = round(entry_price * (1 - config.STOP_LOSS_PCT), 2)
+                    profit_price = round(entry_price * (1 + config.TAKE_PROFIT_PCT), 2)
+                else:
+                    # Can't determine price — place simple order as fallback
+                    log.warning(f"Can't get price for {symbol} bracket — placing simple market order")
+                    stop_price = None
+                    profit_price = None
+
+            if stop_price and profit_price:
+                order = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=qty,
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.GTC,
+                    order_class=OrderClass.BRACKET,
+                    take_profit=TakeProfitRequest(limit_price=profit_price),
+                    stop_loss=StopLossRequest(stop_price=stop_price),
+                )
+                log.info(f"🟢 BRACKET BUY {qty} {symbol} — SL: ${stop_price} / TP: ${profit_price}")
+            else:
+                order = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=qty,
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.DAY,
+                )
+
             result = self.trading_client.submit_order(order)
-            log.info(f"🟢 BUY {qty} {symbol} — {reason}")
+            bracket_info = f" [SL: ${stop_price} | TP: ${profit_price}]" if stop_price else ""
+            log.info(f"🟢 BUY {qty} {symbol} — {reason}{bracket_info}")
             log.info(f"   Order ID: {result.id}, Status: {result.status}")
             self.tg.send_trade_alert(
-                f"🟢 BUY {qty} {symbol}\n{reason}\nOrder: {result.id}"
+                f"🟢 BUY {qty} {symbol}{bracket_info}\n{reason}\nOrder: {result.id}"
             )
 
             self.trades_today.append({
@@ -219,24 +302,50 @@ class AlpacaBot:
             log.error(f"❌ Failed to sell {symbol}: {e}")
             return False
 
+    def _get_symbols_with_bracket_legs(self) -> set:
+        """Return symbols that already have active bracket (stop/TP) orders on the exchange."""
+        try:
+            open_orders = self.trading_client.get_orders(
+                filter=GetOrdersRequest(status=QueryOrderStatus.OPEN)
+            )
+            bracket_symbols = set()
+            for o in open_orders:
+                # Bracket legs show up as open stop/limit orders tied to the parent
+                if o.order_class and str(o.order_class) in ("bracket", "oco"):
+                    bracket_symbols.add(o.symbol)
+                # Also catch standalone stop/limit legs with parent_order_id
+                if hasattr(o, "legs") and o.legs:
+                    bracket_symbols.add(o.symbol)
+            return bracket_symbols
+        except Exception as e:
+            log.error(f"Error checking bracket orders: {e}")
+            return set()
+
     def check_stop_loss_take_profit(self):
-        """Check all positions for stop loss / take profit hits."""
+        """Safety net: check positions for SL/TP if bracket orders aren't active on exchange."""
         positions = self.get_positions()
+        bracketed = self._get_symbols_with_bracket_legs()
+
         for pos in positions:
+            if pos["symbol"] in bracketed:
+                # Exchange-level bracket order is handling this position
+                continue
+
+            # Fallback software check for positions without bracket orders
             pnl_pct = pos["pnl_pct"] / 100
 
             if pnl_pct <= -config.STOP_LOSS_PCT:
-                log.warning(f"🛑 STOP LOSS hit on {pos['symbol']} ({pos['pnl_pct']:.1f}%)")
+                log.warning(f"🛑 STOP LOSS (software fallback) on {pos['symbol']} ({pos['pnl_pct']:.1f}%)")
                 self.tg.send_trade_alert(
-                    f"🛑 STOP LOSS — {pos['symbol']} at {pos['pnl_pct']:.1f}%"
+                    f"🛑 STOP LOSS — {pos['symbol']} at {pos['pnl_pct']:.1f}% (no bracket order active)"
                 )
                 self.place_sell(pos["symbol"], int(pos["qty"]),
                               f"Stop loss at {pos['pnl_pct']:.1f}%")
 
             elif pnl_pct >= config.TAKE_PROFIT_PCT:
-                log.info(f"🎯 TAKE PROFIT hit on {pos['symbol']} ({pos['pnl_pct']:.1f}%)")
+                log.info(f"🎯 TAKE PROFIT (software fallback) on {pos['symbol']} ({pos['pnl_pct']:.1f}%)")
                 self.tg.send_trade_alert(
-                    f"🎯 TAKE PROFIT — {pos['symbol']} at {pos['pnl_pct']:.1f}%"
+                    f"🎯 TAKE PROFIT — {pos['symbol']} at {pos['pnl_pct']:.1f}% (no bracket order active)"
                 )
                 self.place_sell(pos["symbol"], int(pos["qty"]),
                               f"Take profit at {pos['pnl_pct']:.1f}%")
@@ -312,7 +421,7 @@ class AlpacaBot:
             qty = decision.get("adjusted_qty", prop["qty"])
             reason = f"Confidence {prop['confidence']:.0%}: {', '.join(prop['reasons'])} | Claude: {decision.get('reason', 'approved')}"
 
-            self.place_buy(prop["symbol"], qty, reason)
+            self.place_buy(prop["symbol"], qty, reason, entry_price=prop["price"])
             scan_results.append(f"🟢 {prop['symbol']}: BUY {qty} @ ${prop['price']:.2f} — {reason}")
 
             if not self.can_buy():
