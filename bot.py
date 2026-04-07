@@ -21,10 +21,12 @@ from alpaca.trading.requests import (
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
+from alpaca.data.enums import DataFeed
 from alpaca.data.timeframe import TimeFrame
 
 import config
 from strategies import generate_signal
+from telegram_alerts import TelegramAlerts
 
 # ─── Logging ───
 logging.basicConfig(
@@ -62,6 +64,11 @@ class AlpacaBot:
         )
         self.paper = paper
         self.trades_today = []
+        self.tg = TelegramAlerts(
+            bot_token=config.TELEGRAM_BOT_TOKEN,
+            group_chat_id=config.TELEGRAM_GROUP_CHAT_ID,
+            alerts_topic_id=config.TELEGRAM_ALERTS_TOPIC_ID,
+        )
 
         # Verify connection
         account = self.trading_client.get_account()
@@ -105,9 +112,10 @@ class AlpacaBot:
             symbol_or_symbols=symbol,
             timeframe=TimeFrame.Hour,
             start=datetime.now(ET) - timedelta(days=days),
+            feed=DataFeed.IEX,
         )
         bars = self.data_client.get_stock_bars(request)
-        if symbol not in bars or len(bars[symbol]) == 0:
+        if symbol not in bars.data or len(bars[symbol]) == 0:
             return pd.DataFrame()
 
         data = [{
@@ -159,6 +167,9 @@ class AlpacaBot:
             result = self.trading_client.submit_order(order)
             log.info(f"🟢 BUY {qty} {symbol} — {reason}")
             log.info(f"   Order ID: {result.id}, Status: {result.status}")
+            self.tg.send_trade_alert(
+                f"🟢 BUY {qty} {symbol}\n{reason}\nOrder: {result.id}"
+            )
 
             self.trades_today.append({
                 "time": datetime.now(ET).isoformat(),
@@ -186,6 +197,9 @@ class AlpacaBot:
             result = self.trading_client.submit_order(order)
             log.info(f"🔴 SELL {qty} {symbol} — {reason}")
             log.info(f"   Order ID: {result.id}, Status: {result.status}")
+            self.tg.send_trade_alert(
+                f"🔴 SELL {qty} {symbol}\n{reason}\nOrder: {result.id}"
+            )
 
             self.trades_today.append({
                 "time": datetime.now(ET).isoformat(),
@@ -209,11 +223,17 @@ class AlpacaBot:
 
             if pnl_pct <= -config.STOP_LOSS_PCT:
                 log.warning(f"🛑 STOP LOSS hit on {pos['symbol']} ({pos['pnl_pct']:.1f}%)")
+                self.tg.send_trade_alert(
+                    f"🛑 STOP LOSS — {pos['symbol']} at {pos['pnl_pct']:.1f}%"
+                )
                 self.place_sell(pos["symbol"], int(pos["qty"]),
                               f"Stop loss at {pos['pnl_pct']:.1f}%")
 
             elif pnl_pct >= config.TAKE_PROFIT_PCT:
                 log.info(f"🎯 TAKE PROFIT hit on {pos['symbol']} ({pos['pnl_pct']:.1f}%)")
+                self.tg.send_trade_alert(
+                    f"🎯 TAKE PROFIT — {pos['symbol']} at {pos['pnl_pct']:.1f}%"
+                )
                 self.place_sell(pos["symbol"], int(pos["qty"]),
                               f"Take profit at {pos['pnl_pct']:.1f}%")
 
@@ -362,7 +382,11 @@ def main():
     schedule.every(config.SCAN_INTERVAL_MINUTES).minutes.do(bot.run_cycle)
 
     # Daily summary at market close
-    schedule.every().day.at("16:05").do(lambda: log.info(bot.status()))
+    def daily_summary():
+        status = bot.status()
+        log.info(status)
+        bot.tg.send_briefing(f"📊 End of Day Summary\n\n{status}")
+    schedule.every().day.at("16:05").do(daily_summary)
 
     try:
         while True:
