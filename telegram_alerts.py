@@ -14,7 +14,7 @@ import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-log = logging.getLogger("AlpacaBotOptions")
+log = logging.getLogger("AlpacaBot")
 ET = ZoneInfo("America/New_York")
 
 TELEGRAM_API = "https://api.telegram.org/bot{token}"
@@ -79,7 +79,7 @@ class TelegramAlerts:
             if resp.status_code != 200:
                 log.error(f"Telegram send failed ({resp.status_code}): {resp.text[:200]}")
             else:
-                log.debug("Telegram message sent successfully")
+                log.info("Telegram message sent successfully")
 
         except Exception as e:
             log.error(f"Telegram send error: {e}")

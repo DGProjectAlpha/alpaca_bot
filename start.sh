@@ -17,9 +17,9 @@ fi
 
 # Install dependencies
 echo "Installing dependencies..."
-pip install -r requirements.txt -q
+pip3 install -r requirements.txt -q
 
 echo ""
 echo "Starting AlpacaBot..."
 echo ""
-python bot.py
+python3 bot.py

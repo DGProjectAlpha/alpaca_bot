@@ -32,6 +32,10 @@ import config
 from strategies import generate_signal
 from telegram_alerts import TelegramAlerts
 from trade_journal import log_activity
+from premarket_scanner import PremarketScanner
+
+# ─── Trailing Stop High-Water Mark Tracking ───
+TRAILING_STOPS_FILE = "/workspace/AlpacaBot/trailing_stops.json"
 
 # ─── Logging ───
 logging.basicConfig(
@@ -69,6 +73,7 @@ class AlpacaBot:
         )
         self.paper = paper
         self.trades_today = []
+        self.rejected_today = set()  # symbols rejected by Claude — skip for rest of day
         self.tg = TelegramAlerts(
             bot_token=config.TELEGRAM_BOT_TOKEN,
             group_chat_id=config.TELEGRAM_GROUP_CHAT_ID,
@@ -87,7 +92,15 @@ class AlpacaBot:
         log.info(f"Max position size: {config.MAX_POSITION_PCT*100:.0f}%")
         log.info(f"Stop loss: {config.STOP_LOSS_PCT*100:.0f}% / Take profit: {config.TAKE_PROFIT_PCT*100:.0f}%")
         log.info(f"Bracket orders: ENABLED (exchange-level SL/TP)")
+        log.info(f"Trailing stop: {config.TRAILING_STOP_PCT*100:.0f}% trail (activates after +{config.TRAILING_STOP_ACTIVATE_PCT*100:.1f}%)")
         log.info(f"{'='*50}")
+
+        # Pre-market scanner
+        self.premarket = PremarketScanner(
+            data_client=self.data_client,
+            tg=self.tg,
+            bot=self,
+        )
 
         # Protect any existing positions that don't have bracket orders
         self._protect_existing_positions()
@@ -150,6 +163,125 @@ class AlpacaBot:
                 )
             except Exception as e:
                 log.error(f"❌ Failed to protect {pos['symbol']}: {e}")
+
+    # ═══════════════════════════════════════════════════════════
+    # Trailing Stop Loss System
+    # ═══════════════════════════════════════════════════════════
+
+    def _load_trailing_stops(self) -> dict:
+        """Load high-water marks from disk."""
+        try:
+            with open(TRAILING_STOPS_FILE, "r") as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def _save_trailing_stops(self, data: dict):
+        """Persist high-water marks to disk."""
+        with open(TRAILING_STOPS_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+
+    def _update_high_water_marks(self, positions: list):
+        """Update the high-water mark for each open position."""
+        marks = self._load_trailing_stops()
+        held_symbols = set()
+
+        for pos in positions:
+            sym = pos["symbol"]
+            held_symbols.add(sym)
+            current = pos["current_price"]
+            entry = pos["avg_entry"]
+
+            if sym not in marks:
+                # First time tracking — initialize with entry price
+                marks[sym] = {
+                    "entry_price": entry,
+                    "high_water": max(current, entry),
+                    "updated": datetime.now(ET).isoformat(),
+                }
+            else:
+                # Update high-water mark if current price is higher
+                if current > marks[sym]["high_water"]:
+                    marks[sym]["high_water"] = current
+                    marks[sym]["updated"] = datetime.now(ET).isoformat()
+
+        # Clean up symbols we no longer hold
+        stale = [s for s in marks if s not in held_symbols]
+        for s in stale:
+            del marks[s]
+
+        self._save_trailing_stops(marks)
+        return marks
+
+    def check_trailing_stops(self):
+        """Check if any position has dropped enough from its high-water mark to trigger a trailing stop sell."""
+        positions = self.get_positions()
+        if not positions:
+            return
+
+        marks = self._update_high_water_marks(positions)
+        bracketed = self._get_symbols_with_bracket_legs()
+
+        for pos in positions:
+            sym = pos["symbol"]
+            current = pos["current_price"]
+            entry = pos["avg_entry"]
+
+            if sym not in marks:
+                continue
+
+            hwm = marks[sym]["high_water"]
+            gain_from_entry = (hwm - entry) / entry
+
+            # Only activate trailing stop once position has gained enough
+            if gain_from_entry < config.TRAILING_STOP_ACTIVATE_PCT:
+                continue
+
+            # Check if price has dropped TRAILING_STOP_PCT from the high-water mark
+            drop_from_peak = (hwm - current) / hwm
+
+            if drop_from_peak >= config.TRAILING_STOP_PCT:
+                pnl_pct = (current - entry) / entry * 100
+                log.warning(
+                    f"📉 TRAILING STOP triggered for {sym}: "
+                    f"Peak ${hwm:.2f} → Now ${current:.2f} "
+                    f"(dropped {drop_from_peak*100:.1f}% from peak, P&L: {pnl_pct:+.1f}%)"
+                )
+
+                # Cancel any existing bracket/stop/TP orders for this symbol before selling
+                if sym in bracketed:
+                    self._cancel_orders_for_symbol(sym)
+                    time.sleep(1)  # Brief pause for order cancellation to settle
+
+                reason = (
+                    f"Trailing stop: dropped {drop_from_peak*100:.1f}% from peak ${hwm:.2f}. "
+                    f"P&L: {pnl_pct:+.1f}% (entry ${entry:.2f} → ${current:.2f})"
+                )
+                self.place_sell(sym, int(pos["qty"]), reason)
+
+                self.tg.send_trade_alert(
+                    f"📉 TRAILING STOP — {sym}\n"
+                    f"Peak: ${hwm:.2f} → Now: ${current:.2f}\n"
+                    f"Drop from peak: {drop_from_peak*100:.1f}%\n"
+                    f"P&L: {pnl_pct:+.1f}% (entry ${entry:.2f})\n"
+                    f"Selling {int(pos['qty'])} shares to lock in gains"
+                )
+
+    def _cancel_orders_for_symbol(self, symbol: str):
+        """Cancel all open orders for a specific symbol (bracket legs, stops, etc.)."""
+        try:
+            open_orders = self.trading_client.get_orders(
+                filter=GetOrdersRequest(status=QueryOrderStatus.OPEN)
+            )
+            for order in open_orders:
+                if order.symbol == symbol:
+                    try:
+                        self.trading_client.cancel_order_by_id(order.id)
+                        log.info(f"Cancelled order {order.id} for {symbol} (trailing stop cleanup)")
+                    except Exception as e:
+                        log.warning(f"Failed to cancel order {order.id} for {symbol}: {e}")
+        except Exception as e:
+            log.error(f"Error fetching orders for cancellation: {e}")
 
     def get_account_info(self) -> dict:
         """Get current account state."""
@@ -284,6 +416,76 @@ class AlpacaBot:
             log.error(f"❌ Failed to buy {symbol}: {e}")
             return False
 
+    def place_premarket_buy(self, symbol: str, qty: int, limit_price: float, reason: str) -> bool:
+        """Place an extended-hours limit buy order (pre-market / after-hours)."""
+        if qty <= 0 or limit_price <= 0:
+            return False
+
+        try:
+            order = LimitOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.BUY,
+                limit_price=round(limit_price, 2),
+                time_in_force=TimeInForce.DAY,
+                extended_hours=True,
+            )
+            result = self.trading_client.submit_order(order)
+            log.info(f"🌅 PRE-MKT BUY {qty} {symbol} @ ${limit_price:.2f} — {reason}")
+            log.info(f"   Order ID: {result.id}, Status: {result.status}")
+            self.tg.send_trade_alert(
+                f"🌅 PRE-MKT BUY {qty} {symbol} @ ${limit_price:.2f}\n{reason}\nOrder: {result.id}"
+            )
+            self.trades_today.append({
+                "time": datetime.now(ET).isoformat(),
+                "action": "PRE-MKT BUY",
+                "symbol": symbol,
+                "qty": qty,
+                "limit_price": limit_price,
+                "reason": reason,
+                "order_id": str(result.id),
+            })
+            return True
+
+        except Exception as e:
+            log.error(f"❌ Failed pre-market buy {symbol}: {e}")
+            return False
+
+    def place_premarket_sell(self, symbol: str, qty: int, limit_price: float, reason: str) -> bool:
+        """Place an extended-hours limit sell order (pre-market / after-hours)."""
+        if qty <= 0 or limit_price <= 0:
+            return False
+
+        try:
+            order = LimitOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.SELL,
+                limit_price=round(limit_price, 2),
+                time_in_force=TimeInForce.DAY,
+                extended_hours=True,
+            )
+            result = self.trading_client.submit_order(order)
+            log.info(f"🌅 PRE-MKT SELL {qty} {symbol} @ ${limit_price:.2f} — {reason}")
+            log.info(f"   Order ID: {result.id}, Status: {result.status}")
+            self.tg.send_trade_alert(
+                f"🌅 PRE-MKT SELL {qty} {symbol} @ ${limit_price:.2f}\n{reason}\nOrder: {result.id}"
+            )
+            self.trades_today.append({
+                "time": datetime.now(ET).isoformat(),
+                "action": "PRE-MKT SELL",
+                "symbol": symbol,
+                "qty": qty,
+                "limit_price": limit_price,
+                "reason": reason,
+                "order_id": str(result.id),
+            })
+            return True
+
+        except Exception as e:
+            log.error(f"❌ Failed pre-market sell {symbol}: {e}")
+            return False
+
     def place_sell(self, symbol: str, qty: int, reason: str) -> bool:
         """Place a market sell order."""
         try:
@@ -378,6 +580,8 @@ class AlpacaBot:
         for symbol in config.WATCHLIST:
             if symbol in held:
                 continue
+            if symbol in self.rejected_today:
+                continue
 
             try:
                 bars = self.get_bars(symbol)
@@ -386,7 +590,7 @@ class AlpacaBot:
 
                 signal = generate_signal(bars, config.RSI_OVERSOLD, config.RSI_OVERBOUGHT)
 
-                if signal["action"] == "BUY" and signal["confidence"] >= 0.5:
+                if signal["action"] == "BUY" and signal["confidence"] >= 0.55:
                     price = bars["close"].iloc[-1]
                     qty = self.calculate_position_size(price)
 
@@ -423,6 +627,11 @@ class AlpacaBot:
         for decision in review.get("trades", []):
             trade_id = decision.get("trade_id", 0)
             if decision.get("decision") not in ("approve", "adjust"):
+                # Cache rejection — don't re-propose this symbol today
+                if 1 <= trade_id <= len(proposals):
+                    rejected_sym = proposals[trade_id - 1]["symbol"]
+                    self.rejected_today.add(rejected_sym)
+                    log.info(f"Cached rejection for {rejected_sym} — skipping for rest of day")
                 scan_results.append(f"❌ Trade #{trade_id}: REJECTED — {decision.get('reason', '')}")
                 continue
 
@@ -512,7 +721,7 @@ Be direct. No hedging language. You are protecting real money."""
             result = subprocess.run(
                 [
                     "claude", "-p",
-                    "--model", "sonnet",
+                    "--model", "haiku",
                     "--output-format", "json",
                     "--json-schema", review_schema,
                     "--append-system-prompt", system_prompt,
@@ -644,11 +853,30 @@ Be direct. No hedging language. You are protecting real money."""
             except Exception as e:
                 log.error(f"Error checking exit for {pos['symbol']}: {e}")
 
+    def run_premarket_scan(self):
+        """Pre-market scan cycle — runs during extended hours only."""
+        if not self.premarket.is_extended_hours():
+            return
+        if not self.can_buy():
+            log.info("Pre-market: max positions reached or insufficient buying power.")
+            self.tg.send_trade_alert("🌅 Pre-market scan skipped — max positions reached or insufficient buying power.")
+            return
+        now = datetime.now(ET)
+        session = "PRE-MKT" if self.premarket.is_premarket_hours() else "AFTER-HRS"
+        self.tg.send_trade_alert(f"🌅 {session} scan starting — scanning {len(config.WATCHLIST)} symbols at {now.strftime('%H:%M ET')}...")
+        self.premarket.clear_stale_proposals()
+        self.premarket.scan()
+
     def run_cycle(self):
         """One full scan cycle: check exits, check stops, scan entries."""
         now = datetime.now(ET)
         market_open = now.replace(hour=9, minute=30, second=0)
         market_close = now.replace(hour=16, minute=0, second=0)
+
+        # Reset rejection cache at market open each day
+        if now.hour == 9 and now.minute < (30 + config.SCAN_INTERVAL_MINUTES) and self.rejected_today:
+            log.info(f"New trading day — clearing {len(self.rejected_today)} cached rejections")
+            self.rejected_today.clear()
 
         if now < market_open or now > market_close:
             log.info(f"Market closed. Current ET time: {now.strftime('%H:%M')}")
@@ -661,27 +889,31 @@ Be direct. No hedging language. You are protecting real money."""
         log.info(f"{'─'*40}")
         log.info(f"Running scan cycle at {now.strftime('%H:%M ET')}")
 
-        # 1. Check stop losses and take profits first
+        # 1. Check trailing stops (locks in gains from winners)
+        self.check_trailing_stops()
+
+        # 2. Check fixed stop losses and take profits
         self.check_stop_loss_take_profit()
 
-        # 2. Check existing positions for signal-based exits
+        # 3. Check existing positions for signal-based exits
         self.scan_for_exits()
 
-        # 3. Scan for new entry opportunities
+        # 4. Scan for new entry opportunities
         scan_results = self.scan_for_entries()
 
-        # 4. Log status
+        # 5. Log status
         account = self.get_account_info()
         positions = self.get_positions()
         log.info(f"Portfolio: ${account['equity']:,.2f} | "
                 f"P&L today: ${account['pnl_today']:+,.2f} | "
-                f"Positions: {len(positions)}/{config.MAX_POSITIONS}")
+                f"Positions: {len(positions)}/{config.MAX_POSITIONS} | "
+                f"Rejected today: {len(self.rejected_today)} symbols cached")
 
         for pos in positions:
             log.info(f"  {pos['symbol']}: {pos['qty']} shares @ ${pos['avg_entry']:.2f} "
                     f"→ ${pos['current_price']:.2f} ({pos['pnl_pct']:+.1f}%)")
 
-        # 5. Send scan summary to Telegram
+        # 6. Send scan summary to Telegram
         now = datetime.now(ET)
         pos_lines = []
         for pos in positions:
@@ -746,9 +978,19 @@ def main():
     bot.run_cycle()
     log.info(bot.status())
 
+    # If we're in extended hours, run premarket scan immediately too
+    if bot.premarket.is_extended_hours():
+        log.info("Extended hours detected — running immediate pre-market scan...")
+        bot.tg.send_trade_alert("🌅 AlpacaBot started during extended hours — running pre-market scan now...")
+        bot.run_premarket_scan()
+
     # Schedule recurring scans
     log.info(f"Scheduling scans every {config.SCAN_INTERVAL_MINUTES} minutes...")
     schedule.every(config.SCAN_INTERVAL_MINUTES).minutes.do(bot.run_cycle)
+
+    # Pre-market scans every 30 minutes during extended hours
+    log.info(f"Scheduling pre-market scans every {config.PREMARKET_SCAN_INTERVAL} minutes...")
+    schedule.every(config.PREMARKET_SCAN_INTERVAL).minutes.do(bot.run_premarket_scan)
 
     # Daily summary at market close
     def daily_summary():

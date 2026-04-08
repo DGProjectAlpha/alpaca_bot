@@ -320,7 +320,7 @@ BORDERLINE TRADES (need your decision):
         result = subprocess.run(
             [
                 "claude", "-p",
-                "--model", "sonnet",
+                "--model", "haiku",
                 "--output-format", "json",
                 "--json-schema", REVIEW_SCHEMA,
                 "--append-system-prompt", SYSTEM_PROMPT,

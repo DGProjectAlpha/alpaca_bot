@@ -38,9 +38,11 @@ MARGIN_PORTION = float(os.getenv("MARGIN_PORTION", "1000"))
 # ═══════════════════════════════════════════════════════════════
 MAX_CAPITAL = float(os.getenv("MAX_CAPITAL", "2000"))
 MAX_POSITION_PCT = 0.15          # 15% max per position ($300)
-MAX_POSITIONS = 4                # max 4 simultaneous positions
+MAX_POSITIONS = 50               # max 50 simultaneous positions
 STOP_LOSS_PCT = 0.03
 TAKE_PROFIT_PCT = 0.06
+TRAILING_STOP_PCT = 0.03            # 3% trail below high-water mark
+TRAILING_STOP_ACTIVATE_PCT = 0.015  # only activate trailing stop after +1.5% gain
 
 RSI_PERIOD = 14
 RSI_OVERSOLD = 30
@@ -84,6 +86,20 @@ MARKET_OPEN = "09:30"
 MARKET_CLOSE = "16:00"
 
 # ═══════════════════════════════════════════════════════════════
+# Pre-Market / Extended Hours Trading
+# ═══════════════════════════════════════════════════════════════
+PREMARKET_OPEN = "04:00"             # Alpaca pre-market starts 4:00 AM ET
+PREMARKET_CLOSE = "09:30"            # Ends at regular market open
+AFTERHOURS_OPEN = "16:00"
+AFTERHOURS_CLOSE = "20:00"
+PREMARKET_SCAN_INTERVAL = 30         # minutes between pre-market scans
+PREMARKET_LIMIT_OFFSET_PCT = 0.002   # 0.2% above ask for buys, below bid for sells
+PREMARKET_MIN_GAP_PCT = 0.015        # 1.5% gap minimum to flag as opportunity
+PREMARKET_MIN_VOLUME = 10000         # min pre-market volume to consider
+PREMARKET_MAX_PROPOSALS = 5          # max proposals per scan
+PREMARKET_PROPOSALS_FILE = "pending_premarket.json"
+
+# ═══════════════════════════════════════════════════════════════
 # Options Trading — General ($2,000 account)
 # ═══════════════════════════════════════════════════════════════
 OPTIONS_MAX_CAPITAL = float(os.getenv("OPTIONS_MAX_CAPITAL", "2000"))
@@ -115,7 +131,7 @@ ALL_TICKERS = sorted(set(ETF_UNIVERSE + STOCK_UNIVERSE + WHEEL_STOCKS))
 # ═══════════════════════════════════════════════════════════════
 # Smart Scanning — Event-Driven
 # ═══════════════════════════════════════════════════════════════
-SCAN_INTERVAL_MINUTES = 5        # minutes between full scan cycles
+SCAN_INTERVAL_MINUTES = 10       # minutes between full scan cycles
 CONDITION_CHECK_INTERVAL = 120   # seconds between lightweight condition checks
 SPY_MOVE_THRESHOLD = 0.005       # 0.5% move triggers full rescan
 VIX_CHANGE_THRESHOLD = 1.0       # 1-point VIX change triggers full rescan
