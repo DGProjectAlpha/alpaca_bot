@@ -74,6 +74,10 @@ class AlpacaBot:
         self.paper = paper
         self.trades_today = []
         self.rejected_today = set()  # symbols rejected by Claude — skip for rest of day
+        self.monitor_mode = False    # True = only monitor positions, skip entry scanning
+        self.last_full_scan_time = None  # track when we last did a full scan
+        self.last_spy_price = None       # track SPY for move-triggered rescans
+        self.positions_sold_since_scan = 0  # track sells to trigger rescan
         self.tg = TelegramAlerts(
             bot_token=config.TELEGRAM_BOT_TOKEN,
             group_chat_id=config.TELEGRAM_GROUP_CHAT_ID,
@@ -163,6 +167,96 @@ class AlpacaBot:
                 )
             except Exception as e:
                 log.error(f"❌ Failed to protect {pos['symbol']}: {e}")
+
+    # ═══════════════════════════════════════════════════════════
+    # Smart Scanning — Monitor Mode + Rescan Triggers
+    # ═══════════════════════════════════════════════════════════
+
+    def _get_spy_price(self) -> float:
+        """Get current SPY price for market move detection."""
+        try:
+            bars = self.get_bars("SPY")
+            if not bars.empty:
+                return bars["close"].iloc[-1]
+        except Exception as e:
+            log.warning(f"Failed to get SPY price: {e}")
+        return 0.0
+
+    def _check_rescan_triggers(self) -> str:
+        """Check if any trigger warrants leaving monitor mode for a full rescan.
+        Returns trigger reason string, or empty string if no trigger."""
+        now = datetime.now(ET)
+
+        # Trigger 1: SPY moved significantly since last scan
+        if self.last_spy_price and self.last_spy_price > 0:
+            current_spy = self._get_spy_price()
+            if current_spy > 0:
+                move = abs(current_spy - self.last_spy_price) / self.last_spy_price
+                if move >= config.SPY_MOVE_THRESHOLD:
+                    return f"SPY moved {move:.1%} since last scan (${self.last_spy_price:.2f} → ${current_spy:.2f})"
+
+        # Trigger 2: Enough time has passed (cooldown expired)
+        if self.last_full_scan_time:
+            hours_since = (now - self.last_full_scan_time).total_seconds() / 3600
+            if hours_since >= config.RESCAN_COOLDOWN_HOURS:
+                return f"{hours_since:.1f}h since last scan (cooldown: {config.RESCAN_COOLDOWN_HOURS}h)"
+
+        # Trigger 3: A position was sold (frees capital, worth looking for new entries)
+        if self.positions_sold_since_scan > 0:
+            count = self.positions_sold_since_scan
+            self.positions_sold_since_scan = 0
+            return f"{count} position(s) sold — scanning for new entries"
+
+        return ""
+
+    def _enter_monitor_mode(self):
+        """Enter monitor mode — stop scanning for entries, only monitor existing positions."""
+        if not self.monitor_mode:
+            self.monitor_mode = True
+            rejected_pct = len(self.rejected_today) / len(config.WATCHLIST) * 100
+            msg = (f"💤 Entering MONITOR MODE — {len(self.rejected_today)}/{len(config.WATCHLIST)} "
+                   f"symbols rejected ({rejected_pct:.0f}%). Only monitoring positions now.\n"
+                   f"Will rescan if: SPY moves >{config.SPY_MOVE_THRESHOLD*100:.0f}%, "
+                   f"{config.RESCAN_COOLDOWN_HOURS}h passes, or a position sells.")
+            log.info(msg)
+            self.tg.send_trade_alert(msg)
+
+    def _exit_monitor_mode(self, reason: str):
+        """Exit monitor mode and do a full scan."""
+        if self.monitor_mode:
+            self.monitor_mode = False
+            msg = f"🔄 Exiting MONITOR MODE — {reason}"
+            log.info(msg)
+            self.tg.send_trade_alert(msg)
+
+    def _should_enter_monitor_mode(self) -> bool:
+        """Check if we should enter monitor mode based on rejection ratio."""
+        if len(config.WATCHLIST) == 0:
+            return False
+        rejection_ratio = len(self.rejected_today) / len(config.WATCHLIST)
+        return rejection_ratio >= config.MONITOR_MODE_THRESHOLD
+
+    def run_monitor_check(self):
+        """Lightweight check during monitor mode — only positions + triggers."""
+        now = datetime.now(ET)
+        market_open = now.replace(hour=9, minute=30, second=0)
+        market_close = now.replace(hour=16, minute=0, second=0)
+
+        if now < market_open or now > market_close or now.weekday() >= 5:
+            return
+
+        if not self.monitor_mode:
+            return
+
+        # Check trailing stops and stop loss/take profit (always active)
+        self.check_trailing_stops()
+        self.check_stop_loss_take_profit()
+
+        # Check if any trigger warrants a full rescan
+        trigger = self._check_rescan_triggers()
+        if trigger:
+            self._exit_monitor_mode(trigger)
+            self.run_cycle()
 
     # ═══════════════════════════════════════════════════════════
     # Trailing Stop Loss System
@@ -510,6 +604,7 @@ class AlpacaBot:
                 "reason": reason,
                 "order_id": str(result.id),
             })
+            self.positions_sold_since_scan += 1  # trigger rescan in monitor mode
             return True
 
         except Exception as e:
@@ -867,16 +962,21 @@ Be direct. No hedging language. You are protecting real money."""
         self.premarket.clear_stale_proposals()
         self.premarket.scan()
 
-    def run_cycle(self):
-        """One full scan cycle: check exits, check stops, scan entries."""
+    def run_cycle(self, force=False):
+        """One full scan cycle: check exits, check stops, scan entries.
+        If force=True, run even if in monitor mode (used for fixed-time scans)."""
         now = datetime.now(ET)
         market_open = now.replace(hour=9, minute=30, second=0)
         market_close = now.replace(hour=16, minute=0, second=0)
 
-        # Reset rejection cache at market open each day
-        if now.hour == 9 and now.minute < (30 + config.SCAN_INTERVAL_MINUTES) and self.rejected_today:
-            log.info(f"New trading day — clearing {len(self.rejected_today)} cached rejections")
-            self.rejected_today.clear()
+        # Reset rejection cache + monitor mode at market open each day
+        if now.hour == 9 and now.minute < (30 + config.SCAN_INTERVAL_MINUTES):
+            if self.rejected_today:
+                log.info(f"New trading day — clearing {len(self.rejected_today)} cached rejections")
+                self.rejected_today.clear()
+            if self.monitor_mode:
+                self.monitor_mode = False
+                log.info("New trading day — exiting monitor mode")
 
         if now < market_open or now > market_close:
             log.info(f"Market closed. Current ET time: {now.strftime('%H:%M')}")
@@ -886,8 +986,13 @@ Be direct. No hedging language. You are protecting real money."""
             log.info("Weekend. Market closed.")
             return
 
+        # If in monitor mode and not forced, skip the full scan
+        if self.monitor_mode and not force:
+            log.info(f"📡 Monitor mode — skipping full scan at {now.strftime('%H:%M ET')}")
+            return
+
         log.info(f"{'─'*40}")
-        log.info(f"Running scan cycle at {now.strftime('%H:%M ET')}")
+        log.info(f"Running {'FORCED ' if force else ''}scan cycle at {now.strftime('%H:%M ET')}")
 
         # 1. Check trailing stops (locks in gains from winners)
         self.check_trailing_stops()
@@ -901,35 +1006,47 @@ Be direct. No hedging language. You are protecting real money."""
         # 4. Scan for new entry opportunities
         scan_results = self.scan_for_entries()
 
-        # 5. Log status
+        # Track scan state for smart scanning
+        self.last_full_scan_time = now
+        self.last_spy_price = self._get_spy_price()
+        self.positions_sold_since_scan = 0
+
+        # 5. Check if we should enter monitor mode
+        if self._should_enter_monitor_mode():
+            self._enter_monitor_mode()
+
+        # 6. Log status
         account = self.get_account_info()
         positions = self.get_positions()
+        mode_tag = " [MONITOR]" if self.monitor_mode else ""
         log.info(f"Portfolio: ${account['equity']:,.2f} | "
                 f"P&L today: ${account['pnl_today']:+,.2f} | "
                 f"Positions: {len(positions)}/{config.MAX_POSITIONS} | "
-                f"Rejected today: {len(self.rejected_today)} symbols cached")
+                f"Rejected today: {len(self.rejected_today)} symbols cached{mode_tag}")
 
         for pos in positions:
             log.info(f"  {pos['symbol']}: {pos['qty']} shares @ ${pos['avg_entry']:.2f} "
                     f"→ ${pos['current_price']:.2f} ({pos['pnl_pct']:+.1f}%)")
 
-        # 6. Send scan summary to Telegram
-        now = datetime.now(ET)
-        pos_lines = []
-        for pos in positions:
-            emoji = "🟢" if pos["pnl_pct"] > 0 else "🔴"
-            pos_lines.append(f"  {emoji} {pos['symbol']}: {pos['qty']:.0f} @ ${pos['current_price']:.2f} ({pos['pnl_pct']:+.1f}%)")
+        # 7. Send scan summary to Telegram ONLY if there are actual signals or trades
+        # Suppress the "no signals" spam — only notify when something meaningful happens
+        if scan_results or force:
+            now = datetime.now(ET)
+            pos_lines = []
+            for pos in positions:
+                emoji = "🟢" if pos["pnl_pct"] > 0 else "🔴"
+                pos_lines.append(f"  {emoji} {pos['symbol']}: {pos['qty']:.0f} @ ${pos['current_price']:.2f} ({pos['pnl_pct']:+.1f}%)")
 
-        summary = f"📡 Scan {now.strftime('%H:%M ET')}\n"
-        summary += f"💰 ${account['equity']:,.2f} | P&L: ${account['pnl_today']:+,.2f}\n"
-        if pos_lines:
-            summary += "\n".join(pos_lines) + "\n"
-        if scan_results:
-            summary += "\nSignals:\n" + "\n".join(scan_results)
-        else:
-            summary += "\nNo signals triggered."
+            summary = f"📡 Scan {now.strftime('%H:%M ET')}{mode_tag}\n"
+            summary += f"💰 ${account['equity']:,.2f} | P&L: ${account['pnl_today']:+,.2f}\n"
+            if pos_lines:
+                summary += "\n".join(pos_lines) + "\n"
+            if scan_results:
+                summary += "\nSignals:\n" + "\n".join(scan_results)
+            else:
+                summary += "\nNo signals triggered."
 
-        self.tg.send_trade_alert(summary)
+            self.tg.send_trade_alert(summary)
 
     def status(self) -> str:
         """Return a human-readable status string."""
@@ -966,33 +1083,72 @@ Be direct. No hedging language. You are protecting real money."""
 
 
 def main():
-    """Main loop — scan every N minutes during market hours."""
+    """Main loop — smart scanning with monitor mode."""
     if not config.API_KEY or not config.SECRET_KEY:
         log.error("Missing API keys! Copy .env.example to .env and add your Alpaca keys.")
         sys.exit(1)
 
     bot = AlpacaBot()
 
-    # Run immediately on start
+    # ── Catch-up logic: run any fixed scans we missed due to late start ──
+    now = datetime.now(ET)
+    current_time_str = now.strftime("%H:%M")
+
+    # Check which fixed scans should have fired today but were missed
+    fixed_market_scans = [config.FIXED_SCAN_OPEN, config.FIXED_SCAN_PRECLOSE]
+    fixed_extended_scans = [config.FIXED_SCAN_PREMARKET, config.FIXED_SCAN_POSTMARKET]
+
+    missed_market = [t for t in fixed_market_scans if t <= current_time_str]
+    missed_extended = [t for t in fixed_extended_scans if t <= current_time_str]
+
+    # Run initial scan (always)
     log.info("Running initial scan...")
-    bot.run_cycle()
+    bot.run_cycle(force=True)  # force=True so it sends to Telegram on startup
     log.info(bot.status())
+
+    if missed_market:
+        log.info(f"Catch-up: missed fixed market scans {missed_market} — initial forced scan covers these")
 
     # If we're in extended hours, run premarket scan immediately too
     if bot.premarket.is_extended_hours():
         log.info("Extended hours detected — running immediate pre-market scan...")
         bot.tg.send_trade_alert("🌅 AlpacaBot started during extended hours — running pre-market scan now...")
         bot.run_premarket_scan()
+    elif missed_extended:
+        log.info(f"Catch-up: missed extended-hours scans {missed_extended} — running pre-market scan now...")
+        bot.run_premarket_scan()
 
-    # Schedule recurring scans
-    log.info(f"Scheduling scans every {config.SCAN_INTERVAL_MINUTES} minutes...")
+    # ── Recurring scans (only fire if NOT in monitor mode) ──
+    log.info(f"Scheduling scans every {config.SCAN_INTERVAL_MINUTES} minutes (skipped in monitor mode)...")
     schedule.every(config.SCAN_INTERVAL_MINUTES).minutes.do(bot.run_cycle)
 
-    # Pre-market scans every 30 minutes during extended hours
-    log.info(f"Scheduling pre-market scans every {config.PREMARKET_SCAN_INTERVAL} minutes...")
-    schedule.every(config.PREMARKET_SCAN_INTERVAL).minutes.do(bot.run_premarket_scan)
+    # ── Monitor mode checks (lightweight, every 60s) ──
+    log.info(f"Scheduling monitor checks every {config.CONDITION_CHECK_INTERVAL}s...")
+    schedule.every(config.CONDITION_CHECK_INTERVAL).seconds.do(bot.run_monitor_check)
 
-    # Daily summary at market close
+    # ── Fixed-time scans (always run regardless of monitor mode) ──
+    def forced_market_scan():
+        log.info("⏰ Fixed-time market scan triggered")
+        bot.run_cycle(force=True)
+
+    schedule.every().day.at(config.FIXED_SCAN_OPEN).do(forced_market_scan)
+    schedule.every().day.at(config.FIXED_SCAN_PRECLOSE).do(forced_market_scan)
+    log.info(f"Fixed scans: {config.FIXED_SCAN_OPEN}, {config.FIXED_SCAN_PRECLOSE} ET")
+
+    # ── Pre-market + post-market fixed scans ──
+    def premarket_fixed_scan():
+        log.info("⏰ Fixed pre-market scan (4:01 AM ET)")
+        bot.run_premarket_scan()
+
+    def postmarket_fixed_scan():
+        log.info("⏰ Fixed post-market scan (7:00 PM ET)")
+        bot.run_premarket_scan()
+
+    schedule.every().day.at(config.FIXED_SCAN_PREMARKET).do(premarket_fixed_scan)
+    schedule.every().day.at(config.FIXED_SCAN_POSTMARKET).do(postmarket_fixed_scan)
+    log.info(f"Extended hours scans: {config.FIXED_SCAN_PREMARKET} (pre), {config.FIXED_SCAN_POSTMARKET} (post)")
+
+    # ── Daily summary at market close ──
     def daily_summary():
         status = bot.status()
         log.info(status)

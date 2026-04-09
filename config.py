@@ -132,9 +132,17 @@ ALL_TICKERS = sorted(set(ETF_UNIVERSE + STOCK_UNIVERSE + WHEEL_STOCKS))
 # Smart Scanning — Event-Driven
 # ═══════════════════════════════════════════════════════════════
 SCAN_INTERVAL_MINUTES = 10       # minutes between full scan cycles
-CONDITION_CHECK_INTERVAL = 120   # seconds between lightweight condition checks
-SPY_MOVE_THRESHOLD = 0.005       # 0.5% move triggers full rescan
+CONDITION_CHECK_INTERVAL = 60    # seconds between lightweight monitor-mode checks
+SPY_MOVE_THRESHOLD = 0.01        # 1% SPY move since last scan triggers full rescan
 VIX_CHANGE_THRESHOLD = 1.0       # 1-point VIX change triggers full rescan
+RESCAN_COOLDOWN_HOURS = 2        # hours between time-based rescans in monitor mode
+MONITOR_MODE_THRESHOLD = 0.80    # enter monitor mode if 80%+ of watchlist rejected
+
+# Fixed scan times (ET) — always run these regardless of monitor mode
+FIXED_SCAN_PREMARKET = "04:01"   # pre-market scan
+FIXED_SCAN_OPEN = "09:31"        # market open scan
+FIXED_SCAN_PRECLOSE = "15:30"    # 30 min before close
+FIXED_SCAN_POSTMARKET = "19:00"  # post-market scan
 
 # ═══════════════════════════════════════════════════════════════
 # Strategy Risk Limits (% of equity per trade)
